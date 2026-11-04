@@ -1,0 +1,48 @@
+[
+  {
+    "pdf_filename": "C26368.pdf",
+    "ground_truth_file": "C26368 bom20261102.xlsx",
+    "evaluation_mode": "SCHEMATIC_MODE",
+    "total_ground_truth_items": 38,
+    "total_predicted_items": 38,
+    "recalled_items": 38,
+    "model_matched_items": 38,
+    "quantity_matched_items": 38,
+    "exact_matched_items": 38,
+    "metrics": {
+      "物料召回率 (Recall)": "100.00%",
+      "型号准确率 (Model Accuracy)": "100.00%",
+      "数量准确率 (Quantity Accuracy)": "100.00%",
+      "整单正确率 (Exact Match Rate)": "100.00%",
+      "recall_value": 100.0,
+      "model_accuracy_value": 100.0,
+      "quantity_accuracy_value": 100.0,
+      "exact_match_value": 100.0
+    },
+    "review_anomalies_detected": 6,
+    "mismatches": []
+  },
+  {
+    "pdf_filename": "双钱L9_20261020.pdf",
+    "ground_truth_file": "双钱L9_部件清单_20261020.xlsx",
+    "evaluation_mode": "PART_LIST_MODE",
+    "total_ground_truth_items": 114,
+    "total_predicted_items": 114,
+    "recalled_items": 114,
+    "model_matched_items": 114,
+    "quantity_matched_items": 114,
+    "exact_matched_items": 114,
+    "metrics": {
+      "物料召回率 (Recall)": "100.00%",
+      "型号准确率 (Model Accuracy)": "100.00%",
+      "数量准确率 (Quantity Accuracy)": "100.00%",
+      "整单正确率 (Exact Match Rate)": "100.00%",
+      "recall_value": 100.0,
+      "model_accuracy_value": 100.0,
+      "quantity_accuracy_value": 100.0,
+      "exact_match_value": 100.0
+    },
+    "review_anomalies_detected": 6,
+    "mismatches": []
+  }
+]

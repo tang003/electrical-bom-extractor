@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>工业电气原理图 BOM 智能提取与图文核对工作台</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div id="app" style="display:flex; flex-direction:column; height:100vh; overflow:hidden;">
+    <!-- Top Header -->
+    <header class="top-header">
+      <div class="brand-area">
+        <div class="brand-logo">⚡</div>
+        <div>
+          <div class="brand-title">工业电控柜电气原理图 BOM 智能提取与图文审核台</div>
+          <div class="brand-subtitle">PyMuPDF 矢量坐标引擎 + 视觉模型局部切片 + 企业电气规则校验 (支持在线修改与导出)</div>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <select class="project-select" v-model="currentProjectId" @change="loadProject(currentProjectId)">
+          <option v-for="p in projects" :key="p.project_id" :value="p.project_id">
+            📄 {{ p.pdf_filename }} ({{ p.page_count }}页 | 明细:{{ p.itemized_count }} | 待审:{{ p.pending_review_count }})
+          </option>
+        </select>
+
+        <label class="btn btn-outline" style="margin:0;">
+          📤 上传新图纸 PDF
+          <input type="file" accept=".pdf" style="display:none;" @change="handleFileUpload" />
+        </label>
+
+        <button class="btn btn-outline" @click="openVlmModal">🤖 AI 视觉模型配置</button>
+        <button class="btn btn-outline" @click="openRulesModal">⚙️ 企业选型规则库</button>
+        <button class="btn btn-outline" @click="downloadJson">📥 导出 JSON</button>
+        <button class="btn btn-success" @click="downloadExcel">📊 导出标准 BOM (Excel)</button>
+      </div>
+    </header>
+
+    <!-- Summary & Benchmark Strip -->
+    <div class="summary-strip" v-if="projectData">
+      <div class="summary-left">
+        <span class="mode-pill">{{ projectData.summary.extraction_mode_label }}</span>
+        <span>项目：<strong>{{ projectData.project_name }}</strong> ({{ projectData.drawing_no }})</span>
+        <span>原图明文：<strong>{{ projectData.summary.source_breakdown?.explicit || 0 }}</strong></span>
+        <span>拓扑/规则补全：<strong>{{ (projectData.summary.source_breakdown?.topology_inferred || 0) + (projectData.summary.source_breakdown?.rule_completed || 0) }}</strong></span>
+        <span v-if="toastMessage" style="color:#15803d; font-weight:700; background:#dcfce7; padding:2px 10px; border-radius:6px;">
+          {{ toastMessage }}
+        </span>
+      </div>
+
+      <div class="summary-right" v-if="projectData.evaluation">
+        <span style="color:#475569;">基准对比 ({{ projectData.evaluation.ground_truth_file }})：</span>
+        <span class="metric-chip">召回率 {{ projectData.evaluation.metrics['物料召回率 (Recall)'] }}</span>
+        <span class="metric-chip">型号准确率 {{ projectData.evaluation.metrics['型号准确率 (Model Accuracy)'] }}</span>
+        <span class="metric-chip">数量准确率 {{ projectData.evaluation.metrics['数量准确率 (Quantity Accuracy)'] }}</span>
+        <span class="metric-chip">整单正确率 {{ projectData.evaluation.metrics['整单正确率 (Exact Match Rate)'] }}</span>
+      </div>
+    </div>
+
+    <!-- Main Split Workbench -->
+    <div class="workbench-main" v-if="projectData">
+      <!-- Left: Interactive PDF Viewer with BBox Overlay -->
+      <section class="pdf-pane">
+        <div class="pdf-toolbar">
+          <div class="page-nav-group">
+            <button class="btn btn-outline btn-sm" :disabled="currentPage <= 1" @click="currentPage--">◀ 上一页</button>
+            <span style="font-size:13px; font-weight:700;">
+              第 {{ currentPage }} / {{ projectData.page_count }} 页
+            </span>
+            <button class="btn btn-outline btn-sm" :disabled="currentPage >= projectData.page_count" @click="currentPage++">下一页 ▶</button>
+            <span class="page-type-tag" v-if="currentPageInfo">
+              {{ currentPageInfo.page_type_label }} · {{ currentPageInfo.title }}
+            </span>
+          </div>
+
+          <div class="page-nav-group">
+            <button
+              class="btn btn-primary btn-sm"
+              :disabled="aiLoading"
+              title="将当前图纸页发送给多模态视觉大模型深度识别（适用于纯图片扫描件或陌生图纸）"
+              @click="triggerAiPageRecognize"
+            >
+              {{ aiLoading ? '⏳ AI 识别中...' : '✨ AI 视觉识别本页' }}
+            </button>
+            <button class="btn btn-outline btn-sm" @click="zoomPercent = Math.max(60, zoomPercent - 15)">➖</button>
+            <span style="font-size:12px; min-width:44px; text-align:center;">{{ zoomPercent }}%</span>
+            <button class="btn btn-outline btn-sm" @click="zoomPercent = Math.min(220, zoomPercent + 15)">➕</button>
+            <button class="btn btn-outline btn-sm" @click="zoomPercent = 100">重置</button>
+          </div>
+        </div>
+
+        <!-- Quick Page Selector Pills -->
+        <div class="page-pills-bar">
+          <span
+            v-for="p in projectData.pages"
+            :key="p.page_num"
+            class="page-pill"
+            :class="{
+              active: currentPage === p.page_num,
+              'has-PartList': p.page_type === 'PART_LIST',
+              'has-Vector': p.has_vector_text_region
+            }"
+            :title="p.page_type_label + ': ' + p.title"
+            @click="currentPage = p.page_num"
+          >
+            P{{ p.page_num }}{{ p.page_type === 'PART_LIST' ? '(表)' : (p.has_vector_text_region ? '(视)' : '') }}
+          </span>
+        </div>
+
+        <!-- PDF Image + Highlighting Overlay -->
+        <div class="pdf-canvas-viewport">
+          <div class="pdf-stage-wrapper" :style="{ width: zoomPercent + '%' }">
+            <img :src="pageImageUrl" class="pdf-page-img" alt="PDF Page" />
+            <div
+              v-if="activeBox && activeBox.page === currentPage && activeBox.norm_bbox"
+              class="bbox-highlight"
+              :style="{
+                left: (activeBox.norm_bbox[0] * 100) + '%',
+                top: (activeBox.norm_bbox[1] * 100) + '%',
+                width: Math.max(3, (activeBox.norm_bbox[2] - activeBox.norm_bbox[0]) * 100) + '%',
+                height: Math.max(2.5, (activeBox.norm_bbox[3] - activeBox.norm_bbox[1]) * 100) + '%'
+              }"
+            >
+              <div class="bbox-label">{{ activeBox.label }}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cross-Page Evidence Jumper Bar -->
+        <div class="evidence-jumper-bar" v-if="selectedEvidences && selectedEvidences.length > 0">
+          <span>📍 当前器件跨页关联位置 ({{ selectedEvidences.length }}处)：</span>
+          <span
+            v-for="(ev, idx) in selectedEvidences"
+            :key="idx"
+            class="ev-chip"
+            :class="{ active: currentPage === ev.page }"
+            @click="selectEvidence(ev)"
+          >
+            第{{ ev.page }}页 ({{ ev.role === 'table_row' ? '部件列表行' : (ev.role === 'main_circuit' ? '主回路' : '原理图符号') }}: {{ ev.raw_text.slice(0, 18) }})
+          </span>
+        </div>
+      </section>
+
+      <!-- Right: Editable BOM Table & Review Queue -->
+      <section class="table-pane">
+        <!-- Tabs Header -->
+        <div class="tabs-header">
+          <div class="tab-btn-group">
+            <button class="tab-btn" :class="{ active: activeTab === 'primary' }" @click="activeTab = 'primary'">
+              {{ isPartListMode ? '📑 部件清单明细 (主表)' : '📋 BOM 采购汇总表 (主表)' }}
+              <span class="badge-count">{{ primaryBomList.length }}</span>
+            </button>
+
+            <button class="tab-btn" :class="{ active: activeTab === 'secondary' }" @click="activeTab = 'secondary'">
+              {{ isPartListMode ? '📋 按型号合并采购汇总' : '📑 按位号展开视图' }}
+              <span class="badge-count">{{ secondaryBomList.length }}</span>
+            </button>
+
+            <button class="tab-btn" :class="{ active: activeTab === 'reviews' }" @click="activeTab = 'reviews'">
+              🔍 待审核与交叉校验
+              <span class="badge-count danger">{{ pendingReviewCount }} / {{ projectData.review_items.length }}</span>
+            </button>
+
+            <button
+              v-if="projectData.filtered_items && projectData.filtered_items.length > 0"
+              class="tab-btn"
+              :class="{ active: activeTab === 'filtered' }"
+              @click="activeTab = 'filtered'"
+            >
+              🗑️ 已过滤备查
+              <span class="badge-count">{{ projectData.filtered_items.length }}</span>
+            </button>
+          </div>
+
+          <button class="btn btn-primary btn-sm" @click="openAddModal">➕ 新增物料行</button>
+        </div>
+
+        <!-- Search & Filter Toolbar (for BOM tables) -->
+        <div class="filter-toolbar" v-if="activeTab === 'primary' || activeTab === 'secondary'">
+          <input
+            type="text"
+            class="search-input"
+            v-model="searchQuery"
+            placeholder="🔍 搜索位号(-QF1 / =02-K1)、名称(接触器/断路器)、型号(LC1D / 6ES7)、品牌(施耐德)..."
+          />
+          <select class="source-filter-select" v-model="sourceFilter">
+            <option value="ALL">全部数据来源</option>
+            <option value="EXPLICIT">原图明文</option>
+            <option value="TOPOLOGY_INFERRED">拓扑推导</option>
+            <option value="RULE_COMPLETED">规则补全</option>
+            <option value="ESTIMATED_AUX">工程估算</option>
+            <option value="MANUAL_EDITED">人工已改</option>
+          </select>
+          <span style="font-size:12px; color:#64748b;">💡 点击任意行左侧图纸自动高亮定位；双击或点【修改】可直接在线编辑</span>
+        </div>
+
+        <!-- Tab 1 & 2: Editable BOM Table -->
+        <div class="table-scroll-container" v-if="activeTab === 'primary' || activeTab === 'secondary'">
+          <table class="bom-table">
+            <thead>
+              <tr>
+                <th style="width:46px;">序号</th>
+                <th style="width:120px;">位号/标识符</th>
+                <th style="width:90px;">品牌/制造商</th>
+                <th style="width:120px;">名称/描述</th>
+                <th>型号 / 订货编号</th>
+                <th style="width:52px;">单位</th>
+                <th style="width:62px;">数量</th>
+                <th style="width:95px;">备注</th>
+                <th style="width:82px;">图纸页码</th>
+                <th style="width:76px;">来源</th>
+                <th style="width:105px;">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="item in currentTableItems"
+                :key="item.id"
+                :class="{
+                  'selected-row': selectedItemId === item.id,
+                  'editing-row': editingId === item.id
+                }"
+                @click="selectBomRow(item)"
+                @dblclick="startEdit(item)"
+              >
+                <td><strong>{{ item.seq_no }}</strong></td>
+
+                <!-- Tag -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.tag" @click.stop />
+                  <span v-else style="font-family:Consolas,monospace; font-size:12px; color:#1e40af;">{{ item.tag }}</span>
+                </td>
+
+                <!-- Brand -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.brand" @click.stop />
+                  <span v-else>{{ item.brand }}</span>
+                </td>
+
+                <!-- Name -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.name" @click.stop />
+                  <span v-else style="font-weight:600;">{{ item.name }}</span>
+                </td>
+
+                <!-- Model -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.model" @click.stop />
+                  <div v-else>
+                    <span style="font-family:Consolas,monospace; font-weight:600; color:#0f172a;">{{ item.model }}</span>
+                    <div v-if="item.review_note" style="font-size:11px; color:#64748b; margin-top:2px;">
+                      {{ item.review_note }}
+                    </div>
+                  </div>
+                </td>
+
+                <!-- Unit -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.unit" @click.stop />
+                  <span v-else>{{ item.unit }}</span>
+                </td>
+
+                <!-- Quantity -->
+                <td>
+                  <input
+                    v-if="editingId === item.id"
+                    type="number"
+                    step="any"
+                    class="inline-input"
+                    v-model="editForm.quantity"
+                    @click.stop
+                  />
+                  <strong v-else style="color:#0f172a; font-size:13px;">{{ item.quantity }}</strong>
+                </td>
+
+                <!-- Remark -->
+                <td>
+                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.remark" @click.stop />
+                  <span v-else style="color:#475569; font-size:12px;">{{ item.remark }}</span>
+                </td>
+
+                <!-- Page -->
+                <td>
+                  <span style="color:#2563eb; text-decoration:underline; font-size:12px;">
+                    {{ item.pdf_page_label || ('第' + item.primary_page + '页') }}
+                  </span>
+                </td>
+
+                <!-- Source badge -->
+                <td>
+                  <span class="src-badge" :class="'src-' + item.source_type">
+                    {{ sourceLabel(item.source_type) }}
+                  </span>
+                </td>
+
+                <!-- Actions -->
+                <td @click.stop>
+                  <template v-if="editingId === item.id">
+                    <button class="btn btn-success btn-sm" @click="saveEdit(item)">保存</button>
+                    <button class="btn btn-light btn-sm" style="margin-left:4px;" @click="cancelEdit">取消</button>
+                  </template>
+                  <template v-else>
+                    <button class="btn btn-light btn-sm" @click="startEdit(item)">修改</button>
+                    <button class="btn btn-danger-light btn-sm" style="margin-left:4px;" @click="deleteBomRow(item)">删</button>
+                  </template>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Tab 3: Review & Cross-Verification Queue -->
+        <div class="table-scroll-container" v-if="activeTab === 'reviews'">
+          <div class="review-list">
+            <div
+              v-for="rev in projectData.review_items"
+              :key="rev.id"
+              class="review-card"
+              :class="['sev-' + rev.severity, rev.status !== 'PENDING' ? 'status-done' : '']"
+              @click="selectReviewCard(rev)"
+            >
+              <div class="review-card-header">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span class="sev-tag" :class="rev.severity">
+                    {{ rev.severity === 'CONFLICT' ? '⚠️ 型号/位号冲突' : (rev.severity === 'WARNING' ? '🔍 疑似漏项/笔误' : 'ℹ️ 工程规则与推导说明') }}
+                  </span>
+                  <strong style="font-family:Consolas,monospace; color:#1e40af;">{{ rev.tag }}</strong>
+                  <span style="font-size:12px; color:#64748b;">📍 第 {{ rev.page }} 页</span>
+                </div>
+                <span style="font-size:12px; font-weight:700;" :style="{ color: rev.status === 'ACCEPTED' ? '#16a34a' : (rev.status === 'IGNORED' ? '#64748b' : '#d97706') }">
+                  {{ rev.status === 'ACCEPTED' ? '✅ 已采纳处理' : (rev.status === 'IGNORED' ? '已忽略' : '待人工确认') }}
+                </span>
+              </div>
+
+              <div class="review-title">{{ rev.title }}</div>
+              <div class="review-desc">{{ rev.description }}</div>
+              <div class="review-suggest">💡 <strong>处理建议：</strong>{{ rev.suggestion }}</div>
+
+              <div class="review-actions" @click.stop>
+                <button class="btn btn-light btn-sm" @click="jumpToLocation(rev.page, rev.norm_bbox, rev.tag)">
+                  🎯 定位第 {{ rev.page }} 页坐标框
+                </button>
+                <button
+                  v-if="rev.related_page"
+                  class="btn btn-light btn-sm"
+                  @click="jumpToLocation(rev.related_page, rev.related_norm_bbox, rev.tag + ' (关联页)')"
+                >
+                  🔗 对比第 {{ rev.related_page }} 页
+                </button>
+                <button
+                  v-if="rev.status === 'PENDING'"
+                  class="btn btn-primary btn-sm"
+                  @click="handleReviewAction(rev, 'ACCEPT')"
+                >
+                  {{ rev.action_type === 'ADD_ITEM' ? '✅ 采纳并加入 BOM' : (rev.action_type === 'UPDATE_ITEM' ? '✅ 采纳并修正 BOM' : '✔️ 确认无误') }}
+                </button>
+                <button
+                  v-if="rev.status === 'PENDING'"
+                  class="btn btn-light btn-sm"
+                  @click="handleReviewAction(rev, 'IGNORE')"
+                >
+                  忽略此项
+                </button>
+                <button
+                  v-if="rev.status !== 'PENDING'"
+                  class="btn btn-light btn-sm"
+                  @click="handleReviewAction(rev, 'RESET')"
+                >
+                  重置为待审
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Filtered Items (Recoverable) -->
+        <div class="table-scroll-container" v-if="activeTab === 'filtered'">
+          <table class="bom-table">
+            <thead>
+              <tr>
+                <th>原序号</th>
+                <th>设备标识符</th>
+                <th>名称/描述</th>
+                <th>原订货编号</th>
+                <th>原数量</th>
+                <th>原备注</th>
+                <th>过滤原因</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="fit in projectData.filtered_items"
+                :key="fit.id"
+                @click="selectBomRow(fit)"
+              >
+                <td>{{ fit.seq_no }}</td>
+                <td style="font-family:Consolas,monospace;">{{ fit.tag }}</td>
+                <td>{{ fit.name }}</td>
+                <td style="font-family:Consolas,monospace;">{{ fit.model }}</td>
+                <td>{{ fit.quantity }}</td>
+                <td>{{ fit.remark }}</td>
+                <td style="color:#64748b; font-size:12px;">{{ fit.review_note }}</td>
+                <td @click.stop>
+                  <button class="btn btn-primary btn-sm" @click="restoreFiltered(fit)">↩️ 恢复至 BOM</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- Modal: Add BOM Row -->
+    <div class="modal-backdrop" v-if="showAddModal" @click.self="showAddModal = false">
+      <div class="modal-box">
+        <div class="modal-header">
+          <span>➕ 手动新增 BOM 物料行</span>
+          <button class="btn btn-outline btn-sm" @click="showAddModal = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-grid">
+            <div class="form-field">
+              <label>设备标识符 / 位号</label>
+              <input v-model="addForm.tag" placeholder="如 -FU2 或 -QF9" />
+            </div>
+            <div class="form-field">
+              <label>品牌 / 制造商</label>
+              <input v-model="addForm.brand" placeholder="如 施耐德 / Siemens" />
+            </div>
+            <div class="form-field">
+              <label>名称 / 描述</label>
+              <input v-model="addForm.name" placeholder="如 断路器 / 熔断器" />
+            </div>
+            <div class="form-field">
+              <label>型号 / 订货编号</label>
+              <input v-model="addForm.model" placeholder="如 IC65N 1P C6" />
+            </div>
+            <div class="form-field">
+              <label>数量</label>
+              <input type="number" step="any" v-model="addForm.quantity" />
+            </div>
+            <div class="form-field">
+              <label>单位</label>
+              <input v-model="addForm.unit" placeholder="个 / 米 / 套" />
+            </div>
+            <div class="form-field">
+              <label>关联图纸页码</label>
+              <input type="number" v-model="addForm.primary_page" />
+            </div>
+            <div class="form-field">
+              <label>备注</label>
+              <input v-model="addForm.remark" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-light" @click="showAddModal = false">取消</button>
+          <button class="btn btn-primary" @click="submitAddItem">确认添加并同步</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Enterprise Rules Configuration -->
+    <div class="modal-backdrop" v-if="showRulesModal" @click.self="showRulesModal = false">
+      <div class="modal-box" style="width:780px;">
+        <div class="modal-header">
+          <span>⚙️ 企业电气选型与清洗规则配置库 (rules_config.json)</span>
+          <button class="btn btn-outline btn-sm" @click="showRulesModal = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:12.5px; color:#475569; margin-bottom:10px;">
+            可在此直接配置：非采购件过滤规则（如液压站 <code>DT/SP</code> 占位号）、西门子 PLC 必配附件补全、施耐德 <code>XB2/GV2</code> 系列映射及导线端子估算规则。保存后将自动重新解析当前图纸。
+          </p>
+          <textarea class="rules-textarea" v-model="rulesJsonText"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-light" @click="showRulesModal = false">取消</button>
+          <button class="btn btn-primary" @click="saveRulesAndReextract">💾 保存规则并重新解析</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: AI Vision Model (VLM) Configuration -->
+    <div class="modal-backdrop" v-if="showVlmModal" @click.self="showVlmModal = false">
+      <div class="modal-box" style="width:620px;">
+        <div class="modal-header">
+          <span>🤖 多模态视觉大模型 (VLM) 接口配置</span>
+          <button class="btn btn-outline btn-sm" @click="showVlmModal = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:12.5px; color:#475569; margin-bottom:14px; line-height:1.5;">
+            <strong>说明：</strong>对于常规 CAD/EPLAN 矢量 PDF 图纸，系统底层直接通过 <code>PyMuPDF</code> 矢量坐标与工程规则解析，<strong>无需消耗 AI Token 即可 100% 运行</strong>。<br/>
+            当遇到<strong>纯图片扫描件 PDF</strong> 或<strong>特殊非标图纸</strong>时，在此填入任意兼容 OpenAI 格式的视觉大模型 API Key（如阿里通义千问 <code>qwen-vl-max</code>、火山豆包视觉、GPT-4o 等），即可使用局部切片或点击左侧 <strong>【✨ AI 视觉识别本页】</strong>。
+          </p>
+          <div class="form-grid" style="grid-template-columns: 1fr;">
+            <div class="form-field">
+              <label>模型服务商说明</label>
+              <input v-model="vlmForm.provider" placeholder="如：阿里云百炼 Qwen-VL / OpenAI" />
+            </div>
+            <div class="form-field">
+              <label>API Base URL (OpenAI 兼容地址)</label>
+              <input v-model="vlmForm.base_url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+            </div>
+            <div class="form-field">
+              <label>视觉模型名称 (Model ID)</label>
+              <input v-model="vlmForm.model" placeholder="qwen-vl-max 或 gpt-4o" />
+            </div>
+            <div class="form-field">
+              <label>API Key (密钥)</label>
+              <input type="password" v-model="vlmForm.api_key" placeholder="sk-..." />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-light" @click="showVlmModal = false">取消</button>
+          <button class="btn btn-primary" @click="saveVlmConfig">💾 保存 AI 配置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/assets/vue.global.prod.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

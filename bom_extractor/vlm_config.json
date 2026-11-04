@@ -1,0 +1,7 @@
+{
+  "provider": "阿里云百炼 (通义千问 Qwen-VL) / OpenAI 兼容接口",
+  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "model": "qwen-vl-max",
+  "api_key": "sk-ws-H.YRDHXRE.4Oph.MEUCIQCScTjDOY_-P3g94jA24hZnJJ3hNgElaRDTF83COtzv8gIgbmKluoGDgaJKKwQVClYdCef8kjyW8SM39NPvf0SMgdA",
+  "auto_use_on_vector_or_scan": true
+}
