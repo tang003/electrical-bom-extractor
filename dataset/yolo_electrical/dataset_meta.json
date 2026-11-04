@@ -1,0 +1,25 @@
+{
+  "dataset_dir": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical",
+  "data_yaml_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\data.yaml",
+  "train_script_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\train_yolo11.py",
+  "yolo_onnx_deployed": false,
+  "image_count": 68,
+  "label_file_count": 68,
+  "total_bounding_boxes": 576,
+  "class_distribution": {
+    "circuit_breaker": 52,
+    "contactor_coil": 320,
+    "contactor_contact": 0,
+    "thermal_relay": 12,
+    "motor": 10,
+    "fuse": 4,
+    "transformer": 12,
+    "plc_module": 14,
+    "switch_button": 76,
+    "terminal_other": 76
+  },
+  "last_archived_project": "ShuangQian_L9",
+  "last_archived_at": "2026-11-04 16:25:53",
+  "newly_archived_pages": 15,
+  "newly_archived_boxes": 193
+}

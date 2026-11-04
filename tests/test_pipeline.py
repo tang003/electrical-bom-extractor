@@ -121,3 +121,46 @@ def test_web_workbench_online_edit_and_export():
     k102_base = next(it for it in after_rev["itemized_bom"] if it["seq_no"] == 119)
     assert k102_base["brand"] == "施耐德"
 
+
+def test_v2_dual_channel_ocr_som_topology_and_yolo_evolver(tmp_path: Path):
+    """
+    Verify v2.0 5-Layer Architecture modules:
+    1. DualChannelOCREngine (RapidOCR offline ONNX engine) reading CAD curve-outlined models on Page 5 & Page 9
+    2. VectorTopologyBuilder & SoMVisualPromptBuilder rendering [#1..#N] Set-of-Mark boxes & NetworkX branches
+    3. YOLOSelfEvolver auto-archiving verified bounding boxes to YOLOv11 format
+    """
+    from bom_extractor.ocr_engine import DualChannelOCREngine
+    from bom_extractor.som_renderer import SoMVisualPromptBuilder
+    from bom_extractor.yolo_evolver import YOLOSelfEvolver
+
+    assert DualChannelOCREngine.is_available() is True
+
+    pdf_path = REF_DIR / "C26368.pdf"
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        # 1. Test RapidOCR curve-outlined text recognition on Page 5 and Page 9
+        p5_text, _ = DualChannelOCREngine.ocr_pdf_region(doc[4], [0.40, 0.72, 0.62, 0.85], dpi=300)
+        assert "REXL2TMP7+RXZE2M114" in p5_text
+
+        p9_text, _ = DualChannelOCREngine.ocr_pdf_region(doc[8], [0.45, 0.34, 0.72, 0.46], dpi=300)
+        assert "LF60G-BPAA850SB" in p9_text
+
+        # 2. Test Set-of-Mark (#1..#N) rendering & NetworkX branch connectivity on Page 2
+        som_out = tmp_path / "som_p02.png"
+        topo = SoMVisualPromptBuilder.render_som_annotated_page(doc[1], som_out, dpi=180)
+        assert som_out.exists()
+        assert len(topo["candidates"]) >= 9
+        assert len(topo["branches"]) >= 3
+        prompt = SoMVisualPromptBuilder.build_actor_vlm_prompt(topo)
+        assert "[#1]" in prompt and "-QF3" in prompt
+    finally:
+        doc.close()
+
+    # 3. Verify YOLOv11 self-evolution dataset status
+    yolo_status = YOLOSelfEvolver.get_dataset_status()
+    assert yolo_status["image_count"] > 0
+    assert yolo_status["total_bounding_boxes"] > 0
+    assert Path(yolo_status["data_yaml_path"]).exists()
+    assert Path(yolo_status["train_script_path"]).exists()
+
+

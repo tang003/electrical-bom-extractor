@@ -8,3 +8,5 @@ env/
 *.log
 output/proj_*/
 output/*/pages_cache/
+dataset/yolo_electrical/images/
+dataset/yolo_electrical/runs/

@@ -4729,7 +4729,7 @@
       "raw_model": "250A",
       "brand": "国产",
       "unit": "个",
-      "quantity": 5.0,
+      "quantity": 5,
       "remark": "",
       "pdf_page_label": "第19页",
       "primary_page": 19,
@@ -4758,7 +4758,7 @@
           "role": "main"
         }
       ],
-      "source_type": "MANUAL_EDITED",
+      "source_type": "ESTIMATED_AUX",
       "category": "auxiliary",
       "needs_review": false,
       "review_note": "依据第1、2、19页端子排 (-X1:1~30, -X2:1~14, -X3:1~28) 及回路额定电流工程配比统计"
@@ -9393,7 +9393,7 @@
       "raw_model": "250A",
       "brand": "国产",
       "unit": "个",
-      "quantity": 5.0,
+      "quantity": 5,
       "remark": "",
       "pdf_page_label": "第19页",
       "primary_page": 19,
@@ -9422,7 +9422,7 @@
           "role": "main"
         }
       ],
-      "source_type": "MANUAL_EDITED",
+      "source_type": "ESTIMATED_AUX",
       "category": "auxiliary",
       "needs_review": false,
       "review_note": "依据第1、2、19页端子排 (-X1:1~30, -X2:1~14, -X3:1~28) 及回路额定电流工程配比统计"
@@ -9635,14 +9635,14 @@
       "issue_type": "MISSING_IN_PART_LIST",
       "tag": "-KT1, -KT2",
       "title": "疑似人工漏项（CAD曲线文字检出）：第 5 页 [-KT1, -KT2] 型号 `REXL2TMP7+RXZE2M114`",
-      "description": "第 5 页底部 `-KT1, -KT2` 定时器型号 `REXL2TMP7+RXZE2M114` 在 CAD 导出时转为几何曲线（不在 PDF 原生文本层），已通过局部视觉切片识别。 人工标准 BOM 中未包含该物料，请确认是否需要加入采购清单。",
+      "description": "第 5 页底部 `-KT1, -KT2` 定时器型号在 CAD 导出时转为几何轮廓曲线，已由本地 RapidOCR 视觉引擎直接识别出 `REXL2TMP7+RXZE2M114`。 人工标准 BOM 中未包含该物料，请确认是否需要加入采购清单。",
       "suggestion": "点击【采纳并加入 BOM】可将 `时间继电器（含底座） (REXL2TMP7+RXZE2M114 × 2)` 自动追加至 BOM 表。",
       "page": 5,
       "norm_bbox": [
-        0.43,
-        0.75,
-        0.56,
-        0.81
+        0.4,
+        0.72,
+        0.62,
+        0.85
       ],
       "related_page": null,
       "related_norm_bbox": null,
@@ -9665,14 +9665,14 @@
       "issue_type": "MISSING_IN_PART_LIST",
       "tag": "-U_TEMP_LEVEL",
       "title": "疑似人工漏项（CAD曲线文字检出）：第 9 页 [-U_TEMP_LEVEL] 型号 `LF60G-BPAA850SB`",
-      "description": "第 9 页虚线框内型号 `LF60G-BPAA850SB` 为 CAD 几何轮廓字（无 PDF 文本层），已通过局部视觉切片识别。 人工标准 BOM 中未包含该物料，请确认是否需要加入采购清单。",
+      "description": "第 9 页虚线框内型号为 CAD 几何轮廓字，已由本地 RapidOCR 视觉引擎直接识别出 `LF60G-BPAA850SB`。 人工标准 BOM 中未包含该物料，请确认是否需要加入采购清单。",
       "suggestion": "点击【采纳并加入 BOM】可将 `电子式温度液位控制器 (LF60G-BPAA850SB × 1)` 自动追加至 BOM 表。",
       "page": 9,
       "norm_bbox": [
-        0.46,
-        0.35,
-        0.71,
-        0.45
+        0.45,
+        0.34,
+        0.72,
+        0.46
       ],
       "related_page": null,
       "related_norm_bbox": null,
@@ -9759,8 +9759,33 @@
       "estimated_aux": 10
     },
     "output_dir": "D:\\project\\electrical-bom-extractor\\output\\C26368",
+    "yolo_dataset_status": {
+      "dataset_dir": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical",
+      "data_yaml_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\data.yaml",
+      "train_script_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\train_yolo11.py",
+      "yolo_onnx_deployed": false,
+      "image_count": 68,
+      "label_file_count": 68,
+      "total_bounding_boxes": 576,
+      "class_distribution": {
+        "circuit_breaker": 52,
+        "contactor_coil": 320,
+        "contactor_contact": 0,
+        "thermal_relay": 12,
+        "motor": 10,
+        "fuse": 4,
+        "transformer": 12,
+        "plc_module": 14,
+        "switch_button": 76,
+        "terminal_other": 76
+      },
+      "last_archived_project": "C26368",
+      "last_archived_at": "2026-11-04 16:25:46",
+      "newly_archived_pages": 19,
+      "newly_archived_boxes": 192
+    },
+    "rapidocr_available": true,
     "excel_path": "D:\\project\\electrical-bom-extractor\\output\\C26368\\C26368_标准BOM清单.xlsx",
-    "json_path": "D:\\project\\electrical-bom-extractor\\output\\C26368\\C26368_提取结果.json",
-    "pending_review_count": 6
+    "json_path": "D:\\project\\electrical-bom-extractor\\output\\C26368\\C26368_提取结果.json"
   }
 }

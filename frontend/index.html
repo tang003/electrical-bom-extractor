@@ -13,8 +13,8 @@
       <div class="brand-area">
         <div class="brand-logo">⚡</div>
         <div>
-          <div class="brand-title">工业电控柜电气原理图 BOM 智能提取与图文审核台</div>
-          <div class="brand-subtitle">PyMuPDF 矢量坐标引擎 + 视觉模型局部切片 + 企业电气规则校验 (支持在线修改与导出)</div>
+          <div class="brand-title">工业电控柜电气原理图 BOM 智能提取与图文审核台 (v2.0)</div>
+          <div class="brand-subtitle">PyMuPDF + RapidOCR 双通道 + 微软 SoM 视觉打标 + NetworkX 导线追线 + Actor-Critic 双模型 + YOLO 自进化</div>
         </div>
       </div>
 
@@ -30,7 +30,8 @@
           <input type="file" accept=".pdf" style="display:none;" @change="handleFileUpload" />
         </label>
 
-        <button class="btn btn-outline" @click="openVlmModal">🤖 AI 视觉模型配置</button>
+        <button class="btn btn-outline" @click="openYoloModal">🧬 YOLO 自进化库</button>
+        <button class="btn btn-outline" @click="openVlmModal">🤖 AI 双模型配置</button>
         <button class="btn btn-outline" @click="openRulesModal">⚙️ 企业选型规则库</button>
         <button class="btn btn-outline" @click="downloadJson">📥 导出 JSON</button>
         <button class="btn btn-success" @click="downloadExcel">📊 导出标准 BOM (Excel)</button>
@@ -76,12 +77,20 @@
 
           <div class="page-nav-group">
             <button
+              class="btn btn-sm"
+              :class="showSomLayer ? 'btn-primary' : 'btn-outline'"
+              title="切换显示微软 Set-of-Mark [#1][#2] 候选元件红框与 NetworkX 纵向导线连通链"
+              @click="toggleSomLayer"
+            >
+              {{ showSomLayer ? '🎯 已开启 SoM 打标层' : '🎯 SoM 候选框/追线层' }}
+            </button>
+            <button
               class="btn btn-primary btn-sm"
               :disabled="aiLoading"
-              title="将当前图纸页发送给多模态视觉大模型深度识别（适用于纯图片扫描件或陌生图纸）"
+              title="执行 5 层流水线：SoM [#编号] 打标 + RapidOCR 双通道 + NetworkX 支路追线 + Actor-Critic 双模型识别本页"
               @click="triggerAiPageRecognize"
             >
-              {{ aiLoading ? '⏳ AI 识别中...' : '✨ AI 视觉识别本页' }}
+              {{ aiLoading ? '⏳ AI 识别中...' : '✨ SoM+AI 识别本页' }}
             </button>
             <button class="btn btn-outline btn-sm" @click="zoomPercent = Math.max(60, zoomPercent - 15)">➖</button>
             <span style="font-size:12px; min-width:44px; text-align:center;">{{ zoomPercent }}%</span>
@@ -138,6 +147,22 @@
             @click="selectEvidence(ev)"
           >
             第{{ ev.page }}页 ({{ ev.role === 'table_row' ? '部件列表行' : (ev.role === 'main_circuit' ? '主回路' : '原理图符号') }}: {{ ev.raw_text.slice(0, 18) }})
+          </span>
+        </div>
+
+        <!-- NetworkX Vertical Branch Chains Bar (when SoM layer is active) -->
+        <div class="evidence-jumper-bar" v-if="showSomLayer && pageTopology && pageTopology.branches && pageTopology.branches.length > 0" style="background:#0f172a; color:#f8fafc; border-top:1px solid #334155;">
+          <span style="color:#38bdf8; font-weight:700;">
+            🕸️ NetworkX 矢量追线 ({{ pageTopology.wire_segment_count }}根导线 / {{ pageTopology.candidates.length }}个 SoM [#编号] 候选框)：
+          </span>
+          <span
+            v-for="b in pageTopology.branches.slice(0, 8)"
+            :key="b.branch_id"
+            class="ev-chip"
+            style="background:#1e293b; color:#e2e8f0; border-color:#475569;"
+            :title="b.chain.join(' -> ')"
+          >
+            {{ b.branch_id }}: {{ b.node_labels.join('→') }}
           </span>
         </div>
       </section>
@@ -482,32 +507,39 @@
       </div>
     </div>
 
-    <!-- Modal: AI Vision Model (VLM) Configuration -->
+    <!-- Modal: AI Vision & Critic Model Configuration -->
     <div class="modal-backdrop" v-if="showVlmModal" @click.self="showVlmModal = false">
-      <div class="modal-box" style="width:620px;">
+      <div class="modal-box" style="width:660px;">
         <div class="modal-header">
-          <span>🤖 多模态视觉大模型 (VLM) 接口配置</span>
+          <span>🤖 Actor-Critic 双大模型 & RapidOCR 双通道配置</span>
           <button class="btn btn-outline btn-sm" @click="showVlmModal = false">✕</button>
         </div>
         <div class="modal-body">
-          <p style="font-size:12.5px; color:#475569; margin-bottom:14px; line-height:1.5;">
-            <strong>说明：</strong>对于常规 CAD/EPLAN 矢量 PDF 图纸，系统底层直接通过 <code>PyMuPDF</code> 矢量坐标与工程规则解析，<strong>无需消耗 AI Token 即可 100% 运行</strong>。<br/>
-            当遇到<strong>纯图片扫描件 PDF</strong> 或<strong>特殊非标图纸</strong>时，在此填入任意兼容 OpenAI 格式的视觉大模型 API Key（如阿里通义千问 <code>qwen-vl-max</code>、火山豆包视觉、GPT-4o 等），即可使用局部切片或点击左侧 <strong>【✨ AI 视觉识别本页】</strong>。
+          <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:10px 12px; margin-bottom:12px; font-size:12.5px; color:#166534;">
+            <strong>✅ 第1层（本地 RapidOCR 离线双通道引擎）：</strong> 已就绪（无需 API Key，自动识别 CAD 曲线化轮廓文字如 <code>REXL2TMP7</code>、<code>LF60G-BPAA850SB</code> 与矢量电柜尺寸）。<br/>
+            <strong>✅ 第2层（免 YOLO 矢量分离 + NetworkX 追线 + 微软 SoM 视觉打标）：</strong> 已就绪（自动在图纸上生成 <code>[#1], [#2]</code> 候选元件框与纵向连通支路）。
+          </div>
+          <p style="font-size:12.5px; color:#475569; margin-bottom:12px; line-height:1.5;">
+            配置任意兼容 OpenAI 接口的多模态视觉模型（<strong>Actor</strong>，如 <code>qwen-vl-max</code> / <code>gemini-2.5-pro</code> / <code>claude-3-7-sonnet</code> / <code>gpt-4o</code>）与推理审计模型（<strong>Critic</strong>，如 <code>deepseek-r1</code> / <code>o3-mini</code>），即可开启完整的 <strong>SoM 视觉锚定 + Actor-Critic 反思闭环</strong>。
           </p>
-          <div class="form-grid" style="grid-template-columns: 1fr;">
-            <div class="form-field">
+          <div class="form-grid" style="grid-template-columns: 1fr 1fr;">
+            <div class="form-field" style="grid-column: span 2;">
               <label>模型服务商说明</label>
-              <input v-model="vlmForm.provider" placeholder="如：阿里云百炼 Qwen-VL / OpenAI" />
+              <input v-model="vlmForm.provider" placeholder="如：阿里云百炼 / OpenAI / Gemini / DeepSeek" />
             </div>
-            <div class="form-field">
+            <div class="form-field" style="grid-column: span 2;">
               <label>API Base URL (OpenAI 兼容地址)</label>
               <input v-model="vlmForm.base_url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
             </div>
             <div class="form-field">
-              <label>视觉模型名称 (Model ID)</label>
-              <input v-model="vlmForm.model" placeholder="qwen-vl-max 或 gpt-4o" />
+              <label>Actor 视觉识图模型 (VLM Model)</label>
+              <input v-model="vlmForm.model" placeholder="qwen-vl-max / gpt-4o / gemini-2.5-pro" />
             </div>
             <div class="form-field">
+              <label>Critic 推理审计模型 (Reasoning LLM)</label>
+              <input v-model="vlmForm.critic_model" placeholder="deepseek-r1 / o3-mini / qwen-max" />
+            </div>
+            <div class="form-field" style="grid-column: span 2;">
               <label>API Key (密钥)</label>
               <input type="password" v-model="vlmForm.api_key" placeholder="sk-..." />
             </div>
@@ -515,7 +547,60 @@
         </div>
         <div class="modal-footer">
           <button class="btn btn-light" @click="showVlmModal = false">取消</button>
-          <button class="btn btn-primary" @click="saveVlmConfig">💾 保存 AI 配置</button>
+          <button class="btn btn-primary" @click="saveVlmConfig">💾 保存双模型配置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: YOLOv11 Self-Evolution Dataset & Auto-Trainer -->
+    <div class="modal-backdrop" v-if="showYoloModal" @click.self="showYoloModal = false">
+      <div class="modal-box" style="width:700px;">
+        <div class="modal-header">
+          <span>🧬 工业电气符号 YOLOv11 自进化训练集 (Human-in-the-Loop Autodistill)</span>
+          <button class="btn btn-outline btn-sm" @click="showYoloModal = false">✕</button>
+        </div>
+        <div class="modal-body" v-if="yoloStatus">
+          <p style="font-size:12.5px; color:#475569; margin-bottom:12px; line-height:1.5;">
+            <strong>工作原理：</strong>每次工程师在网页端修改、确认或导出 BOM 时，系统自动将已确认的电气元器件包围盒按 <strong>10 类 IEC 国际电气符号标准</strong> 导出为 <code>YOLOv11</code> 格式（无需人工手动画框标注），随时可运行一键微调脚本生成本厂专属 YOLO 权重。
+          </p>
+          <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:14px;">
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; text-align:center;">
+              <div style="font-size:12px; color:#64748b;">已沉淀原理图页数</div>
+              <div style="font-size:22px; font-weight:800; color:#0f172a;">{{ yoloStatus.image_count }} 页</div>
+            </div>
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; text-align:center;">
+              <div style="font-size:12px; color:#64748b;">已自动标注元件框总数</div>
+              <div style="font-size:22px; font-weight:800; color:#2563eb;">{{ yoloStatus.total_bounding_boxes }} 个</div>
+            </div>
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; text-align:center;">
+              <div style="font-size:12px; color:#64748b;">本地 ONNX 权重状态</div>
+              <div style="font-size:14px; font-weight:700; margin-top:4px;" :style="{ color: yoloStatus.yolo_onnx_deployed ? '#16a34a' : '#d97706' }">
+                {{ yoloStatus.yolo_onnx_deployed ? '✅ 已部署就绪' : '📦 样本收集中 (使用矢量+SoM)' }}
+              </div>
+            </div>
+          </div>
+
+          <div style="font-size:12px; font-weight:700; color:#334155; margin-bottom:6px;">📊 10 类电气符号自动标注分布：</div>
+          <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:6px; margin-bottom:14px; font-size:12px;">
+            <div
+              v-for="(cnt, cname) in yoloStatus.class_distribution"
+              :key="cname"
+              style="background:#f1f5f9; padding:5px 10px; border-radius:6px; display:flex; justify-content:space-between;"
+            >
+              <span style="font-family:Consolas,monospace; color:#1e293b;">{{ cname }}</span>
+              <strong style="color:#0f172a;">{{ cnt }} 框</strong>
+            </div>
+          </div>
+
+          <div style="background:#0f172a; color:#e2e8f0; padding:10px 12px; border-radius:8px; font-family:Consolas,monospace; font-size:11.5px; line-height:1.6;">
+            <div># 数据集配置路径: {{ yoloStatus.data_yaml_path }}</div>
+            <div># 一键启动 YOLOv11 微调并导出 ONNX 命令:</div>
+            <div style="color:#38bdf8;">python dataset/yolo_electrical/train_yolo11.py</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-light" @click="showYoloModal = false">关闭</button>
+          <button class="btn btn-primary" @click="archiveCurrentProjectToYolo">📥 立即将当前项目坐标沉淀至训练集</button>
         </div>
       </div>
     </div>

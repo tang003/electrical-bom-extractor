@@ -8118,7 +8118,7 @@
       "name": "继电器底座",
       "model": "RXZE2M114",
       "raw_model": "RXZE2M114",
-      "brand": "施耐德",
+      "brand": "菲尼克斯",
       "unit": "个",
       "quantity": 1,
       "remark": "",
@@ -8183,9 +8183,9 @@
           "role": "schematic_symbol"
         }
       ],
-      "source_type": "MANUAL_EDITED",
+      "source_type": "EXPLICIT",
       "category": "primary",
-      "needs_review": false,
+      "needs_review": true,
       "review_note": "同型号 `RXZE2M114` 其余 22 处品牌均为 `施耐德`，此处疑为笔误 `菲尼克斯`"
     },
     {
@@ -12328,7 +12328,7 @@
     {
       "id": "agg_29",
       "seq_no": 29,
-      "tag": "=02-K1, =02-K2, =02-K3, =02-K4, =02-K5, =02-K6 等(23个)",
+      "tag": "=02-K1, =02-K2, =02-K3, =02-K4, =02-K5, =02-K6 等(22个)",
       "tags": [
         "=02-K1",
         "=02-K2",
@@ -12351,8 +12351,7 @@
         "=02-K19",
         "=02-K20",
         "=02-K21",
-        "=02-K101",
-        "=02-K102"
+        "=02-K101"
       ],
       "placement": "",
       "name": "继电器底座",
@@ -12360,7 +12359,7 @@
       "raw_model": "RXZE2M114",
       "brand": "施耐德",
       "unit": "个",
-      "quantity": 23,
+      "quantity": 22,
       "remark": "",
       "pdf_page_label": "第3页, 第7页, 第10页, 第12页 等",
       "primary_page": 23,
@@ -13474,57 +13473,6 @@
             0.2412
           ],
           "raw_text": "-K101",
-          "role": "schematic_symbol"
-        },
-        {
-          "page": 27,
-          "bbox": [
-            45.0,
-            481.08,
-            1145.55,
-            515.09
-          ],
-          "norm_bbox": [
-            0.0378,
-            0.5714,
-            0.9622,
-            0.6118
-          ],
-          "raw_text": "=02-K102 | 继电器底座 | RXZE2M114 | 菲尼克斯",
-          "role": "table_row"
-        },
-        {
-          "page": 10,
-          "bbox": [
-            262.56,
-            575.79,
-            289.13,
-            586.42
-          ],
-          "norm_bbox": [
-            0.2205,
-            0.6839,
-            0.2429,
-            0.6965
-          ],
-          "raw_text": "-K102",
-          "role": "schematic_symbol"
-        },
-        {
-          "page": 12,
-          "bbox": [
-            526.26,
-            192.67,
-            552.84,
-            203.3
-          ],
-          "norm_bbox": [
-            0.442,
-            0.2289,
-            0.4644,
-            0.2415
-          ],
-          "raw_text": "-K102",
           "role": "schematic_symbol"
         }
       ],
@@ -14773,6 +14721,87 @@
     {
       "id": "agg_32",
       "seq_no": 32,
+      "tag": "=02-K102",
+      "tags": [
+        "=02-K102"
+      ],
+      "placement": "",
+      "name": "继电器底座",
+      "model": "RXZE2M114",
+      "raw_model": "RXZE2M114",
+      "brand": "菲尼克斯",
+      "unit": "个",
+      "quantity": 1,
+      "remark": "",
+      "pdf_page_label": "第10页, 第12页, 第27页",
+      "primary_page": 27,
+      "primary_bbox": [
+        0.0378,
+        0.5714,
+        0.9622,
+        0.6118
+      ],
+      "evidences": [
+        {
+          "page": 27,
+          "bbox": [
+            45.0,
+            481.08,
+            1145.55,
+            515.09
+          ],
+          "norm_bbox": [
+            0.0378,
+            0.5714,
+            0.9622,
+            0.6118
+          ],
+          "raw_text": "=02-K102 | 继电器底座 | RXZE2M114 | 菲尼克斯",
+          "role": "table_row"
+        },
+        {
+          "page": 10,
+          "bbox": [
+            262.56,
+            575.79,
+            289.13,
+            586.42
+          ],
+          "norm_bbox": [
+            0.2205,
+            0.6839,
+            0.2429,
+            0.6965
+          ],
+          "raw_text": "-K102",
+          "role": "schematic_symbol"
+        },
+        {
+          "page": 12,
+          "bbox": [
+            526.26,
+            192.67,
+            552.84,
+            203.3
+          ],
+          "norm_bbox": [
+            0.442,
+            0.2289,
+            0.4644,
+            0.2415
+          ],
+          "raw_text": "-K102",
+          "role": "schematic_symbol"
+        }
+      ],
+      "source_type": "EXPLICIT",
+      "category": "primary",
+      "needs_review": true,
+      "review_note": "同型号 `RXZE2M114` 其余 22 处品牌均为 `施耐德`，此处疑为笔误 `菲尼克斯`"
+    },
+    {
+      "id": "agg_33",
+      "seq_no": 33,
       "tag": "=02-M1",
       "tags": [
         "=02-M1"
@@ -14852,8 +14881,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_33",
-      "seq_no": 33,
+      "id": "agg_34",
+      "seq_no": 34,
       "tag": "=02-M2",
       "tags": [
         "=02-M2"
@@ -14933,8 +14962,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_34",
-      "seq_no": 34,
+      "id": "agg_35",
+      "seq_no": 35,
       "tag": "=02-MW1",
       "tags": [
         "=02-MW1"
@@ -14997,8 +15026,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_35",
-      "seq_no": 35,
+      "id": "agg_36",
+      "seq_no": 36,
       "tag": "=02-N1",
       "tags": [
         "=02-N1"
@@ -15061,8 +15090,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_36",
-      "seq_no": 36,
+      "id": "agg_37",
+      "seq_no": 37,
       "tag": "=02-PN-EIP",
       "tags": [
         "=02-PN-EIP"
@@ -15125,8 +15154,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_37",
-      "seq_no": 37,
+      "id": "agg_38",
+      "seq_no": 38,
       "tag": "=02-R1",
       "tags": [
         "=02-R1"
@@ -15189,8 +15218,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_38",
-      "seq_no": 38,
+      "id": "agg_39",
+      "seq_no": 39,
       "tag": "=02-R2",
       "tags": [
         "=02-R2"
@@ -15253,8 +15282,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_39",
-      "seq_no": 39,
+      "id": "agg_40",
+      "seq_no": 40,
       "tag": "=02-S1",
       "tags": [
         "=02-S1"
@@ -15317,8 +15346,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_40",
-      "seq_no": 40,
+      "id": "agg_41",
+      "seq_no": 41,
       "tag": "=02-S1",
       "tags": [
         "=02-S1"
@@ -15381,8 +15410,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_41",
-      "seq_no": 41,
+      "id": "agg_42",
+      "seq_no": 42,
       "tag": "=02-S2",
       "tags": [
         "=02-S2"
@@ -15445,8 +15474,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_42",
-      "seq_no": 42,
+      "id": "agg_43",
+      "seq_no": 43,
       "tag": "=02-T1",
       "tags": [
         "=02-T1"
@@ -15509,8 +15538,8 @@
       "review_note": ""
     },
     {
-      "id": "agg_43",
-      "seq_no": 43,
+      "id": "agg_44",
+      "seq_no": 44,
       "tag": "=02-U1",
       "tags": [
         "=02-U1"
@@ -17440,7 +17469,7 @@
       ],
       "related_page": null,
       "related_norm_bbox": null,
-      "status": "ACCEPTED",
+      "status": "PENDING",
       "action_type": "UPDATE_ITEM",
       "proposed_data": {
         "target_seq_no": 119,
@@ -17495,7 +17524,7 @@
     "extraction_mode": "PART_LIST_MODE",
     "extraction_mode_label": "模式A：自带《部件列表》精准提取 + 原理图交叉校验",
     "itemized_count": 114,
-    "aggregated_count": 43,
+    "aggregated_count": 44,
     "filtered_count": 27,
     "review_count": 6,
     "conflict_count": 1,
@@ -17508,8 +17537,33 @@
       "estimated_aux": 0
     },
     "output_dir": "D:\\project\\electrical-bom-extractor\\output\\ShuangQian_L9",
+    "yolo_dataset_status": {
+      "dataset_dir": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical",
+      "data_yaml_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\data.yaml",
+      "train_script_path": "D:\\project\\electrical-bom-extractor\\dataset\\yolo_electrical\\train_yolo11.py",
+      "yolo_onnx_deployed": false,
+      "image_count": 68,
+      "label_file_count": 68,
+      "total_bounding_boxes": 576,
+      "class_distribution": {
+        "circuit_breaker": 52,
+        "contactor_coil": 320,
+        "contactor_contact": 0,
+        "thermal_relay": 12,
+        "motor": 10,
+        "fuse": 4,
+        "transformer": 12,
+        "plc_module": 14,
+        "switch_button": 76,
+        "terminal_other": 76
+      },
+      "last_archived_project": "ShuangQian_L9",
+      "last_archived_at": "2026-11-04 16:25:53",
+      "newly_archived_pages": 15,
+      "newly_archived_boxes": 193
+    },
+    "rapidocr_available": true,
     "excel_path": "D:\\project\\electrical-bom-extractor\\output\\ShuangQian_L9\\双钱L9_20261020_标准BOM清单.xlsx",
-    "json_path": "D:\\project\\electrical-bom-extractor\\output\\ShuangQian_L9\\双钱L9_20261020_提取结果.json",
-    "pending_review_count": 5
+    "json_path": "D:\\project\\electrical-bom-extractor\\output\\ShuangQian_L9\\双钱L9_20261020_提取结果.json"
   }
 }

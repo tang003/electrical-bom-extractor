@@ -11,6 +11,8 @@ from .schematic_extractor import extract_from_schematic_pdf
 from .rules import load_rules_config, apply_engineering_rules, build_aggregated_from_itemized
 from .exporter import export_to_excel, export_to_json
 from .models import ExtractionResult, SourceType
+from .ocr_engine import DualChannelOCREngine
+from .yolo_evolver import YOLOSelfEvolver
 
 
 def run_extraction_pipeline(
@@ -130,7 +132,11 @@ def run_extraction_pipeline(
             summary=summary,
         )
 
-        # Stage 8: Export Excel + JSON
+        # Stage 8: Export Excel + JSON & Archive YOLOv11 Self-Evolution Dataset
+        yolo_status = YOLOSelfEvolver.archive_project_to_yolo_dataset(result, pdf_file)
+        result.summary["yolo_dataset_status"] = yolo_status
+        result.summary["rapidocr_available"] = DualChannelOCREngine.is_available()
+
         excel_path = export_to_excel(result, out_dir / f"{pdf_file.stem}_标准BOM清单.xlsx")
         json_path = export_to_json(result, out_dir / f"{pdf_file.stem}_提取结果.json")
         result.summary["excel_path"] = excel_path

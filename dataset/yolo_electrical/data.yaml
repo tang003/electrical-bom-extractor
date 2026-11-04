@@ -1,0 +1,15 @@
+path: D:/project/electrical-bom-extractor/dataset/yolo_electrical
+train: images/train
+val: images/train
+
+names:
+  0: circuit_breaker
+  1: contactor_coil
+  2: contactor_contact
+  3: thermal_relay
+  4: motor
+  5: fuse
+  6: transformer
+  7: plc_module
+  8: switch_button
+  9: terminal_other

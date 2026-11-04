@@ -51,8 +51,13 @@ createApp({
       provider: "阿里云百炼 (Qwen-VL) / OpenAI 兼容接口",
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       model: "qwen-vl-max",
+      critic_model: "deepseek-r1",
       api_key: "",
     });
+    const showSomLayer = ref(false);
+    const pageTopology = ref(null);
+    const showYoloModal = ref(false);
+    const yoloStatus = ref(null);
     const aiLoading = ref(false);
     const toastMessage = ref("");
 
@@ -96,8 +101,52 @@ createApp({
 
     const pageImageUrl = computed(() => {
       if (!currentProjectId.value || !currentPage.value) return "";
+      if (showSomLayer.value) {
+        return `/api/projects/${currentProjectId.value}/pages/${currentPage.value}/som-image?dpi=180`;
+      }
       return `/api/projects/${currentProjectId.value}/pages/${currentPage.value}/image?dpi=150`;
     });
+
+    async function loadPageTopology() {
+      if (!currentProjectId.value || !currentPage.value || !showSomLayer.value) return;
+      const res = await fetch(
+        `/api/projects/${currentProjectId.value}/pages/${currentPage.value}/topology`
+      );
+      if (res.ok) {
+        pageTopology.value = await res.json();
+      }
+    }
+
+    async function toggleSomLayer() {
+      showSomLayer.value = !showSomLayer.value;
+      if (showSomLayer.value) {
+        await loadPageTopology();
+        showToast("🎯 已开启微软 SoM [#编号] 候选框与 NetworkX 纵向导线连通层！");
+      } else {
+        pageTopology.value = null;
+      }
+    }
+
+    async function openYoloModal() {
+      const res = await fetch("/api/yolo-dataset");
+      if (res.ok) {
+        yoloStatus.value = await res.json();
+      }
+      showYoloModal.value = true;
+    }
+
+    async function archiveCurrentProjectToYolo() {
+      if (!currentProjectId.value) return;
+      const res = await fetch(`/api/projects/${currentProjectId.value}/yolo-archive`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        yoloStatus.value = await res.json();
+        showToast(
+          `🧬 已将当前项目沉淀至 YOLOv11 训练集（累计 ${yoloStatus.value.image_count} 页 / ${yoloStatus.value.total_bounding_boxes} 个标注框）！`
+        );
+      }
+    }
 
     const isPartListMode = computed(() => {
       return projectData.value && projectData.value.extraction_mode === "PART_LIST_MODE";
@@ -438,6 +487,10 @@ createApp({
       rulesJsonText,
       showVlmModal,
       vlmForm,
+      showSomLayer,
+      pageTopology,
+      showYoloModal,
+      yoloStatus,
       aiLoading,
       toastMessage,
       currentPageInfo,
@@ -466,6 +519,9 @@ createApp({
       saveRulesAndReextract,
       openVlmModal,
       saveVlmConfig,
+      toggleSomLayer,
+      openYoloModal,
+      archiveCurrentProjectToYolo,
       triggerAiPageRecognize,
       downloadExcel,
       downloadJson,

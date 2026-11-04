@@ -19,6 +19,8 @@ from bom_extractor.rules import build_aggregated_from_itemized, load_rules_confi
 from bom_extractor.exporter import export_to_excel, export_to_json
 from bom_extractor.evaluator import evaluate_extraction
 from bom_extractor.vision import VisionRecognizer
+from bom_extractor.som_renderer import SoMVisualPromptBuilder
+from bom_extractor.yolo_evolver import YOLOSelfEvolver
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -95,6 +97,10 @@ class ProjectStore:
         proj_out = OUTPUT_DIR / proj_id
         proj_out.mkdir(parents=True, exist_ok=True)
         stem = self.pdf_paths[proj_id].stem if proj_id in self.pdf_paths else proj_id
+        if proj_id in self.pdf_paths and self.pdf_paths[proj_id].exists():
+            res.summary["yolo_dataset_status"] = YOLOSelfEvolver.archive_project_to_yolo_dataset(
+                res, self.pdf_paths[proj_id]
+            )
         excel_path = export_to_excel(res, proj_out / f"{stem}_标准BOM清单.xlsx")
         json_path = export_to_json(res, proj_out / f"{stem}_提取结果.json")
         res.summary["excel_path"] = excel_path
@@ -563,4 +569,71 @@ def ai_recognize_page(project_id: str, page_num: int) -> Dict[str, Any]:
     out = _serialize_project_response(project_id)
     out["ai_added_count"] = added_count
     return out
+
+
+@app.get("/api/projects/{project_id}/pages/{page_num}/som-image")
+def get_page_som_image(project_id: str, page_num: int, dpi: int = 180) -> FileResponse:
+    """
+    Render and return the Microsoft Set-of-Mark (SoM) [#1], [#2] visual annotated image
+    showing all vector-clustered & text-anchored candidate electrical components.
+    """
+    if project_id not in store.pdf_paths:
+        raise HTTPException(status_code=404, detail="Project PDF not found")
+    pdf_path = store.pdf_paths[project_id]
+    pages_cache_dir = OUTPUT_DIR / project_id / "pages_cache"
+    pages_cache_dir.mkdir(parents=True, exist_ok=True)
+    som_png = pages_cache_dir / f"som_page_{page_num:03d}_{dpi}.png"
+
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        if page_num < 1 or page_num > len(doc):
+            raise HTTPException(status_code=400, detail=f"Invalid page number {page_num}")
+        page = doc[page_num - 1]
+        topo = SoMVisualPromptBuilder.render_som_annotated_page(page, som_png, dpi=dpi)
+        topo_json = pages_cache_dir / f"som_topo_{page_num:03d}.json"
+        topo_json.write_text(json.dumps(topo, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        doc.close()
+
+    return FileResponse(str(som_png), media_type="image/png")
+
+
+@app.get("/api/projects/{project_id}/pages/{page_num}/topology")
+def get_page_topology(project_id: str, page_num: int) -> Dict[str, Any]:
+    """
+    Return the Set-of-Mark [#1..#N] candidates, Dual-Channel OCR spans, and NetworkX
+    vertical functional branch connectivity chains for a specific page.
+    """
+    if project_id not in store.pdf_paths:
+        raise HTTPException(status_code=404, detail="Project PDF not found")
+    pdf_path = store.pdf_paths[project_id]
+    pages_cache_dir = OUTPUT_DIR / project_id / "pages_cache"
+    pages_cache_dir.mkdir(parents=True, exist_ok=True)
+    som_png = pages_cache_dir / f"som_page_{page_num:03d}_180.png"
+
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        if page_num < 1 or page_num > len(doc):
+            raise HTTPException(status_code=400, detail=f"Invalid page number {page_num}")
+        page = doc[page_num - 1]
+        topo = SoMVisualPromptBuilder.render_som_annotated_page(page, som_png, dpi=180)
+        return topo
+    finally:
+        doc.close()
+
+
+@app.get("/api/yolo-dataset")
+def get_yolo_dataset_status() -> Dict[str, Any]:
+    return YOLOSelfEvolver.get_dataset_status()
+
+
+@app.post("/api/projects/{project_id}/yolo-archive")
+def archive_project_to_yolo(project_id: str) -> Dict[str, Any]:
+    if project_id not in store.results or project_id not in store.pdf_paths:
+        raise HTTPException(status_code=404, detail="Project not found")
+    status = YOLOSelfEvolver.archive_project_to_yolo_dataset(
+        store.results[project_id], store.pdf_paths[project_id]
+    )
+    return status
+
 
