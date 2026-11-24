@@ -4,104 +4,164 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>工业电气原理图 BOM 智能提取与图文核对工作台</title>
-  <link rel="stylesheet" href="/assets/styles.css" />
+  <link rel="stylesheet" href="/assets/styles.css?v=5" />
+  <link rel="stylesheet" href="/assets/workbench.css?v=20261111-table-rows2" />
 </head>
 <body>
-  <div id="app" style="display:flex; flex-direction:column; height:100vh; overflow:hidden;">
-    <!-- Top Header -->
+  <div id="app" class="bom-app" v-cloak>
     <header class="top-header">
       <div class="brand-area">
-        <div class="brand-logo">⚡</div>
-        <div>
-          <div class="brand-title">工业电控柜电气原理图 BOM 智能提取与图文审核台 (v2.0)</div>
-          <div class="brand-subtitle">PyMuPDF + RapidOCR 双通道 + 微软 SoM 视觉打标 + NetworkX 导线追线 + Actor-Critic 双模型 + YOLO 自进化</div>
-        </div>
+        <div class="brand-logo" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M7 7h8v8H7zM19 7h6M19 11h6M19 15h6M7 21h18M7 25h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="24" cy="25" r="2" fill="#60a5fa"/></svg></div>
+        <div><div class="brand-title">电气 BOM 工作台</div><div class="brand-subtitle">图纸分析 · 物料审核 · 报价准备</div></div>
       </div>
-
-      <div class="header-controls">
-        <select class="project-select" v-model="currentProjectId" @change="loadProject(currentProjectId)">
-          <option v-for="p in projects" :key="p.project_id" :value="p.project_id">
-            📄 {{ p.pdf_filename }} ({{ p.page_count }}页 | 明细:{{ p.itemized_count }} | 待审:{{ p.pending_review_count }})
-          </option>
+      <div class="project-picker" v-if="projects.length">
+        <label for="project-picker">当前项目</label>
+        <select id="project-picker" class="project-select" v-model="currentProjectId" @change="loadProject(currentProjectId)">
+          <option v-for="p in projects" :key="p.project_id" :value="p.project_id">{{ p.pdf_filename }} · {{ p.page_count }} 页{{ p.workflow_mode === 'TABLE_EXTRACT' ? ' · 仅提部件表' : p.extraction_mode_label?.includes('独立识别') ? ' · 独立分析' : p.extraction_mode === 'PART_LIST_MODE' ? ' · 历史清单' : '' }}</option>
         </select>
-
-        <label class="btn btn-outline" style="margin:0;">
-          📤 上传新图纸 PDF
-          <input type="file" accept=".pdf" style="display:none;" @change="handleFileUpload" />
+      </div>
+      <div class="header-controls">
+        <label class="btn btn-light upload-action" :class="{ 'is-disabled': loading }" tabindex="0" role="button" aria-label="上传图纸 PDF、DWG、DXF" @keydown.enter="$refs.uploadInput.click()" @keydown.space.prevent="$refs.uploadInput.click()">
+          <svg class="button-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 13V3m-4 4 4-4 4 4M3 12v4a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="action-label">上传图纸</span><input ref="uploadInput" type="file" accept=".pdf,.dwg,.dxf" hidden :disabled="loading" @change="handleFileUpload" />
         </label>
-
-        <button class="btn btn-outline" @click="openYoloModal">🧬 YOLO 自进化库</button>
-        <button class="btn btn-outline" @click="openVlmModal">🤖 AI 双模型配置</button>
-        <button class="btn btn-outline" @click="openRulesModal">⚙️ 企业选型规则库</button>
-        <button class="btn btn-outline" @click="downloadJson">📥 导出 JSON</button>
-        <button class="btn btn-success" @click="downloadExcel">📊 导出标准 BOM (Excel)</button>
+        <button v-if="projectData && !isTableExtraction" class="btn btn-primary" :disabled="aiBusy || loading || legacyTableProject || (independentInfo && !independentInfo.schematic_pages.length)" @click="startAiExtraction()" aria-label="AI 识别整份图纸"><span class="ai-glyph" aria-hidden="true">✦</span><span class="action-label">{{ aiBusy ? '识别中' : 'AI 识别整份' }}</span></button>
+        <button v-if="projectData" class="btn btn-export" @click="downloadExcel" aria-label="导出 BOM" title="导出简洁物料清单，未解决的问题按需附页">
+          <svg class="button-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3v10m-4-4 4 4 4-4M3 13v4h14v-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="action-label">导出 BOM</span>
+        </button>
+        <details class="toolbar-menu">
+          <summary aria-label="更多工具">更多 <span aria-hidden="true">⌄</span></summary>
+          <div class="tools-popover">
+            <span class="menu-caption">项目工具</span>
+            <button @click="openVlmModal(); closeToolsMenu($event)">AI 服务配置 <span>模型与接口</span></button>
+            <button v-if="projectData" @click="openTableExtraction(); closeToolsMenu($event)">仅提取部件表 <span>另建项目，原审核记录保留</span></button>
+            <button @click="openRulesModal(); closeToolsMenu($event)">选型规则 <span>维护企业建议</span></button>
+            <button @click="openYoloModal(); closeToolsMenu($event)">符号样本库 <span>查看已确认样本</span></button>
+            <button v-if="projectData" @click="downloadJson(); closeToolsMenu($event)">导出 JSON <span>结构化数据</span></button>
+            <button v-if="projectData" @click="downloadExcelDiagnostics(); closeToolsMenu($event)">导出完整诊断资料 <span>原始字段、证据与任务记录</span></button>
+            <button v-if="projects.length" class="menu-danger" @click="clearAllProjects(); closeToolsMenu($event)">清空所有项目 <span>删除图纸与审核结果</span></button>
+          </div>
+        </details>
       </div>
     </header>
 
-    <!-- Summary & Benchmark Strip -->
-    <div class="summary-strip" v-if="projectData">
-      <div class="summary-left">
-        <span class="mode-pill">{{ projectData.summary.extraction_mode_label }}</span>
-        <span>项目：<strong>{{ projectData.project_name }}</strong> ({{ projectData.drawing_no }})</span>
-        <span>原图明文：<strong>{{ projectData.summary.source_breakdown?.explicit || 0 }}</strong></span>
-        <span>拓扑/规则补全：<strong>{{ (projectData.summary.source_breakdown?.topology_inferred || 0) + (projectData.summary.source_breakdown?.rule_completed || 0) }}</strong></span>
-        <span v-if="toastMessage" style="color:#15803d; font-weight:700; background:#dcfce7; padding:2px 10px; border-radius:6px;">
-          {{ toastMessage }}
-        </span>
+    <main v-if="!projectData" class="empty-workspace">
+      <div class="empty-card">
+        <div class="empty-eyebrow">从图纸开始，逐项核对</div>
+        <div class="empty-document" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M13 6h15l8 8v28H13zM28 6v9h8M19 23h11M19 29h11M19 35h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h1>把电气图纸整理成可审核的 BOM</h1>
+        <p>上传 PDF、DWG 或 DXF，查看图纸与物料的对应证据，确认型号、数量和供货范围后导出清单。</p>
+        <label class="btn btn-primary empty-upload">{{ loading ? '正在读取图纸…' : '选择 PDF / DWG / DXF 图纸' }}<input type="file" accept=".pdf,.dwg,.dxf" hidden :disabled="loading" @change="handleFileUpload" /></label><p v-if="loading" role="status">{{ loadingMessage }}</p>
+        <div class="empty-steps"><span><b>01</b>上传图纸</span><span><b>02</b>AI 分析</span><span><b>03</b>审核与导出</span></div>
+        <small>CAD 保留原生文字与属性，按图框生成审核视图。无法确定的型号和数量会保留为待审核。</small>
       </div>
+    </main>
 
-      <div class="summary-right" v-if="projectData.evaluation">
-        <span style="color:#475569;">基准对比 ({{ projectData.evaluation.ground_truth_file }})：</span>
-        <span class="metric-chip">召回率 {{ projectData.evaluation.metrics['物料召回率 (Recall)'] }}</span>
-        <span class="metric-chip">型号准确率 {{ projectData.evaluation.metrics['型号准确率 (Model Accuracy)'] }}</span>
-        <span class="metric-chip">数量准确率 {{ projectData.evaluation.metrics['数量准确率 (Quantity Accuracy)'] }}</span>
-        <span class="metric-chip">整单正确率 {{ projectData.evaluation.metrics['整单正确率 (Exact Match Rate)'] }}</span>
+    <section v-if="projectData" class="workspace-overview" :class="{ 'overview-collapsed': !overviewExpanded }">
+      <div class="workspace-heading">
+        <div class="workspace-summary">
+          <button class="text-button overview-toggle" :aria-expanded="overviewExpanded" aria-controls="workspace-project-info" @click="toggleOverview">项目信息 <span aria-hidden="true">{{ overviewExpanded ? '⌃' : '⌄' }}</span></button>
+          <span class="workspace-summary-text">{{ projectData.page_count }} 页 · {{ isTableExtraction ? '仅提取部件表' : legacyTableProject ? '历史清单' : independentInfo ? '原理图核对' : '图纸分析' }}</span>
+          <button v-if="projectData.summary.cad_import?.requires_sheet_review" class="text-button workspace-alert" @click="!overviewExpanded && toggleOverview()" title="展开项目信息，选择有效图框">图框待核</button>
+          <span v-else-if="isTableExtraction" class="workspace-alert">{{ tableInfo.status === 'loaded' ? '未经原理图核对' : '表格待核' }}</span>
+        </div>
+        <div class="workspace-view-controls"><div class="view-switch" role="group" aria-label="工作区视图">
+          <button :class="{ active: workspaceMode === 'compare' }" :aria-pressed="workspaceMode === 'compare'" @click="setWorkspaceMode('compare')">图纸对照</button>
+          <button :class="{ active: workspaceMode === 'bom' }" :aria-pressed="workspaceMode === 'bom'" @click="setWorkspaceMode('bom')">专注清单</button>
+          <button :class="{ active: workspaceMode === 'drawing' }" :aria-pressed="workspaceMode === 'drawing'" @click="setWorkspaceMode('drawing')">专注图纸</button>
+        </div></div>
       </div>
-    </div>
+      <div id="workspace-project-info" v-show="overviewExpanded" class="workspace-project-info">
+      <div class="project-heading"><h1 :title="projectData.pdf_filename">{{ projectData.project_name || projectData.pdf_filename }}</h1><span class="project-subline">{{ projectData.page_count }} 页图纸 <span v-if="projectData.drawing_no">· 图号 {{ projectData.drawing_no }}</span></span></div>
+      <div class="overview-stats" aria-label="主清单待办筛选">
+        <button class="stat-item" :class="{ 'stat-active': issueFilter === 'ALL' && activeTab === 'primary' }" @click="focusIssue('ALL')"><span class="stat-label">主清单物料</span><strong>{{ issueCounts.ALL }}<small>项</small></strong><span class="stat-hint">{{ isPartListMode ? '按部件清单' : '按采购汇总' }}</span></button>
+        <button class="stat-item stat-amber" :class="{ 'stat-active': issueFilter === 'MODEL' }" @click="focusIssue('MODEL')"><span class="stat-label"><i></i>待选型</span><strong>{{ issueCounts.MODEL }}<small>项</small></strong><span class="stat-hint">补充或确认型号</span></button>
+        <button class="stat-item stat-amber" :class="{ 'stat-active': issueFilter === 'QUANTITY' }" @click="focusIssue('QUANTITY')"><span class="stat-label"><i></i>数量待核</span><strong>{{ issueCounts.QUANTITY }}<small>项</small></strong><span class="stat-hint">含长度与模板套数</span></button>
+        <button class="stat-item stat-blue" :class="{ 'stat-active': issueFilter === 'SCOPE' }" @click="focusIssue('SCOPE')"><span class="stat-label"><i></i>范围待核</span><strong>{{ issueCounts.SCOPE }}<small>项</small></strong><span class="stat-hint">确认采购边界</span></button>
+      </div>
+      <div class="workspace-status-line">
+        <span class="status-dot" :class="{ busy: aiBusy }"></span><span>{{ aiBusy ? 'AI 正在分析，可继续查看图纸' : '识别结果保留原图证据，待办需工程师确认' }}</span>
+        <span v-if="projectData.summary.ai_last_run?.successful_pages" class="ai-coverage">AI 已处理 {{ projectData.summary.ai_last_run.successful_pages.length }}/{{ independentInfo ? independentInfo.schematic_pages.length : projectData.page_count }} 页原理图</span>
+        <details class="diagnostic-info"><summary>识别信息 <span aria-hidden="true">⌄</span></summary><div class="diagnostic-popover"><strong>提取与来源</strong><p>{{ projectData.summary.extraction_quality?.message || '暂无提取诊断' }}</p><p>原图明文 {{ projectData.summary.source_breakdown?.explicit || 0 }} 项 · 视觉补入型号 {{ projectData.summary.source_breakdown?.vision_recognized || 0 }} 项</p><small>候选覆盖与待办数量不代表识别准确率。统计卡片按主清单计算，待办可以重叠。</small></div></details>
+      </div>
+    <details v-if="projectData?.summary?.cad_import" class="cad-import-notice">
+      <summary><strong>{{ projectData.source_format?.toUpperCase() }} 导入</strong><span>{{ projectData.page_count }} 张图纸 · 原生文字 {{ projectData.summary.cad_import.native_text_count }} 条</span><span class="cad-review-label">{{ projectData.summary.cad_import.requires_sheet_review ? '请先核对有效图框' : '查看导入提醒' }} ⌄</span></summary>
+      <div class="cad-import-body"><p v-if="projectData.summary.ai_start_warning" class="cad-ai-warning">{{ projectData.summary.ai_start_warning }}</p><ul><li v-for="warning in projectData.summary.cad_import.warnings" :key="warning">{{ warning }}</li></ul><p>图纸视图用于核对，物料文字来自 CAD 原生实体与块属性。导入成功不代表 BOM 已审核完成。</p><div class="cad-import-links"><a :href="'/api/projects/' + encodeURIComponent(currentProjectId) + '/source'">下载原始 CAD</a><a :href="'/api/projects/' + encodeURIComponent(currentProjectId) + '/cad-report'">下载导入报告</a><button class="text-button" @click="showCadSheets = !showCadSheets">{{ showCadSheets ? '收起选图' : '选择有效图框' }}</button></div>
+        <div v-if="showCadSheets" class="cad-sheet-selection"><p>勾选本次需要的图框，将建立独立新项目。相同图名可能属于不同版本，请对照原图选择。</p><div class="cad-select-actions"><button class="text-button" @click="cadSelectedPages = projectData.pages.map(p => p.page_num)">全选图框</button><button class="text-button" @click="cadSelectedPages = []">清空选择</button><span>已选 {{ cadSelectedPages.length }} / {{ projectData.page_count }} 张</span></div><div class="cad-sheet-grid"><label v-for="p in projectData.pages" :key="p.page_num"><input type="checkbox" v-model="cadSelectedPages" :value="p.page_num" :aria-label="'选择图框 P' + p.page_num"/><span>P{{ p.page_num }} · {{ p.title }}</span></label></div><button class="btn btn-primary btn-sm" @click="createCadSelection" :disabled="loading || !cadSelectedPages.length">按所选图框建立新项目</button></div>
+      </div>
+    </details>
+    <div v-if="legacyTableProject" class="independent-notice"><div><strong>历史清单项目</strong><span>此结果采用旧版图内清单流程。可另建项目，独立识别原理图后再核对原表。</span></div><button class="btn btn-primary btn-sm" :disabled="loading" @click="createIndependentProject">按新流程建立独立分析项目</button></div>
+    <div v-if="isTableExtraction" class="independent-notice table-extraction-notice"><div><strong>仅提取部件表 · 未经原理图核对</strong><span>检测到 {{ tableInfo.detected_pages.length }} 个表页；已提取 {{ projectData.declared_parts.length }} 行，来源 P{{ tableInfo.selected_pages.join('、P') || '未检测到' }}。</span><span v-if="tableInfo.skipped_overlapping_pages.length">已排除 {{ tableInfo.skipped_overlapping_pages.length }} 个重叠图框。</span><span v-if="tableInfo.status !== 'loaded'">{{ tableInfo.status === 'absent' ? '所选范围未检测到可读取的部件表。' : '部分表格未读完整，请检查图页与版式。' }}</span></div><div class="workflow-notice-actions"><button class="text-button" :disabled="loading" @click="openTableExtraction">选择表页重提</button><button class="btn btn-light btn-sm" :disabled="loading" @click="createIndependentProject">另建原理图核对项目</button></div></div>
+    <div v-if="independentInfo" class="independent-notice"><div><strong>原理图独立识别 → 图内清单核对</strong><span>已隔离 {{ independentInfo.excluded_table_pages.length }} 个整表页、{{ independentInfo.mixed_table_pages.length }} 个混合页表区。原表 {{ projectData.declared_parts.length }} 行，仅作核对依据。</span><span v-if="!aiBusy && !aiJob && !projectData.summary.ai_last_run">当前为初步识别，尚未运行 AI 分析。</span></div><div class="workflow-notice-actions"><button class="text-button" @click="openTableExtraction">仅提取部件表</button><button class="text-button" @click="activeTab = 'reconciliation'; workspaceMode === 'drawing' && setWorkspaceMode('compare')">查看清单核对</button></div></div>
+      </div>
+    </section>
+    <details v-if="projectData && aiJob && (overviewExpanded || aiBusy)" class="ai-task" :open="aiBusy">
+      <summary><span class="ai-task-label"><span class="ai-glyph" aria-hidden="true">✦</span>AI {{ aiStatusLabel }}</span><span>已处理 {{ aiJob.completed_pages }}/{{ aiJob.total_pages }} 页 · 疑点复核 {{ aiJob.reviewed_pages }} 页</span><span v-if="aiJob.errors?.length" class="task-error">{{ aiJob.errors.length }} 个页面问题</span><span class="task-expand">任务详情 ⌄</span></summary>
+      <div class="ai-task-body"><p>{{ aiJob.message }}<span v-if="aiJob.current_page"> · 当前第 {{ aiJob.current_page }} 页</span></p><div class="ai-task-meta"><span>{{ aiJob.model }} · {{ aiJob.reasoning_effort }} / {{ aiJob.review_reasoning_effort }}</span><span>调用 {{ aiJob.api_calls }} 次 · 缓存 {{ aiJob.cache_hits }} 页 · 返回用量 {{ (aiJob.input_tokens || 0) + (aiJob.output_tokens || 0) }} Token</span></div><p v-if="aiJob.deferred_review_pages?.length">另有 {{ aiJob.deferred_review_pages.length }} 页疑点待人工核实。</p><div v-for="(error, i) in aiJob.errors" :key="i" class="task-error">第 {{ error.page }} 页：{{ error.message }}</div><button v-if="aiBusy && aiJob.status !== 'merging'" class="btn btn-light btn-sm" @click="cancelAiJob" :disabled="aiJob.cancel_requested">{{ aiJob.cancel_requested ? '取消中' : '取消任务' }}</button><button v-if="['failed','partial','interrupted','cancelled'].includes(aiJob.status)" class="btn btn-primary btn-sm" @click="startAiExtraction(aiJob.pages)">重试，复用成功页面</button></div>
+    </details>
 
-    <!-- Main Split Workbench -->
-    <div class="workbench-main" v-if="projectData">
-      <!-- Left: Interactive PDF Viewer with BBox Overlay -->
-      <section class="pdf-pane">
+    <div class="workbench-main" v-if="projectData" :class="'view-' + workspaceMode">
+      <!-- Left: CAD-Grade Interactive PDF Viewer -->
+      <section class="pdf-pane" v-show="workspaceMode !== 'bom'" :style="{ width: leftPaneWidth + '%' }">
         <div class="pdf-toolbar">
           <div class="page-nav-group">
-            <button class="btn btn-outline btn-sm" :disabled="currentPage <= 1" @click="currentPage--">◀ 上一页</button>
-            <span style="font-size:13px; font-weight:700;">
-              第 {{ currentPage }} / {{ projectData.page_count }} 页
-            </span>
-            <button class="btn btn-outline btn-sm" :disabled="currentPage >= projectData.page_count" @click="currentPage++">下一页 ▶</button>
-            <span class="page-type-tag" v-if="currentPageInfo">
-              {{ currentPageInfo.page_type_label }} · {{ currentPageInfo.title }}
+            <button v-if="independentInfo" class="btn btn-outline btn-sm" :aria-pressed="showAnalysisView" @click="toggleAnalysisView">{{ showAnalysisView ? '显示原始图纸' : '查看 AI 隔离视图' }}</button>
+            <button class="btn btn-outline btn-sm" :disabled="currentPage <= 1" @click="changePage(currentPage - 1)" title="快捷键: 左方向键 ←" aria-label="上一页">◀</button>
+            <select class="page-select-mini" aria-label="图纸页码" v-model.number="currentPage" @change="onPageChanged">
+              <option v-for="p in projectData.pages" :key="p.page_num" :value="p.page_num">
+                第 {{ p.page_num }} / {{ projectData.page_count }} 页 · {{ p.page_type_label }}
+              </option>
+            </select>
+            <button class="btn btn-outline btn-sm" :disabled="currentPage >= projectData.page_count" @click="changePage(currentPage + 1)" title="快捷键: 右方向键 →" aria-label="下一页">▶</button>
+            <span class="page-type-tag" v-if="currentPageInfo" :title="currentPageInfo.title">
+              {{ currentPageInfo.title || currentPageInfo.page_type_label }}
             </span>
           </div>
 
           <div class="page-nav-group">
             <button
               class="btn btn-sm"
-              :class="showSomLayer ? 'btn-primary' : 'btn-outline'"
-              title="切换显示微软 Set-of-Mark [#1][#2] 候选元件红框与 NetworkX 纵向导线连通链"
-              @click="toggleSomLayer"
+              :class="isDrawBoxMode ? 'btn-warning-solid' : 'btn-outline'"
+              title="在图纸上拖出矩形，提取框内文字，人工确认后补录物料与原图证据"
+              @click="toggleDrawBoxMode"
             >
-              {{ showSomLayer ? '🎯 已开启 SoM 打标层' : '🎯 SoM 候选框/追线层' }}
+              {{ isDrawBoxMode ? '退出框选' : '框选补录' }}
             </button>
             <button
+              class="btn btn-sm"
+              :class="showSomLayer ? 'btn-primary' : 'btn-outline'"
+              title="默认显示全部候选；蓝色已关联、橙色待核、灰色参考。点击可查看依据或定位清单"
+              @click="toggleSomLayer"
+            >
+              {{ showSomLayer ? '隐藏候选框' : '显示候选框' }}
+            </button>
+            <button v-if="pageGridBands.length" class="btn btn-sm" :class="showDrawingGrid ? 'btn-primary' : 'btn-outline'"
+              :aria-pressed="showDrawingGrid" title="按 PDF 页眉的真实栏号显示固定分栏；点栏号可横向定位"
+              @click="showDrawingGrid = !showDrawingGrid">{{ showDrawingGrid ? '隐藏图格' : '显示图格' }}</button>
+            <details v-if="showSomLayer" class="som-legend-menu">
+              <summary class="btn btn-outline btn-sm" aria-label="候选框图例与筛选"><span class="som-legend-dots" aria-hidden="true"><i class="som-dot linked"></i><i class="som-dot pending"></i><i class="som-dot reference"></i></span>{{ topologyLoading ? '读取中…' : somFilterLabel + ' ' + filteredSomCandidates.length }} <span aria-hidden="true">⌄</span></summary>
+              <div class="som-legend-popover">
+                <strong>候选框图例与筛选</strong>
+                <button class="som-filter-option" :aria-pressed="somFilter === 'ALL'" @click="somFilter = 'ALL'"><span>全部候选</span><b>{{ somCounts.ALL }}</b></button>
+                <button v-for="kind in somKinds" :key="kind.key" class="som-filter-option" :aria-pressed="somFilter === kind.key" @click="somFilter = kind.key" :title="kind.description"><span><i class="som-dot" :class="kind.key" aria-hidden="true"></i>{{ kind.label }}</span><b>{{ somCounts[kind.key] }}</b><small>{{ kind.description }}</small></button>
+                <label v-if="somCounts.excluded" class="som-excluded-toggle"><input type="checkbox" v-model="somShowExcluded" />查看已排除标注 <b>{{ somCounts.excluded }}</b></label>
+                <p>颜色表示关联和证据类型，不代表审核通过。切换图页后默认显示全部候选。</p>
+              </div>
+            </details>
+            <button
               class="btn btn-primary btn-sm"
-              :disabled="aiLoading"
-              title="执行 5 层流水线：SoM [#编号] 打标 + RapidOCR 双通道 + NetworkX 支路追线 + Actor-Critic 双模型识别本页"
+              :disabled="aiBusy || legacyTableProject || isTableExtraction || !currentPageEligible"
+              title="整页与高清分块识别，疑点提高思考程度复核"
               @click="triggerAiPageRecognize"
             >
-              {{ aiLoading ? '⏳ AI 识别中...' : '✨ SoM+AI 识别本页' }}
+              {{ aiBusy ? 'AI 处理中…' : 'AI 识别本页' }}
             </button>
-            <button class="btn btn-outline btn-sm" @click="zoomPercent = Math.max(60, zoomPercent - 15)">➖</button>
-            <span style="font-size:12px; min-width:44px; text-align:center;">{{ zoomPercent }}%</span>
-            <button class="btn btn-outline btn-sm" @click="zoomPercent = Math.min(220, zoomPercent + 15)">➕</button>
-            <button class="btn btn-outline btn-sm" @click="zoomPercent = 100">重置</button>
           </div>
         </div>
 
         <!-- Quick Page Selector Pills -->
         <div class="page-pills-bar">
-          <span
+          <button type="button"
             v-for="p in projectData.pages"
             :key="p.page_num"
             class="page-pill"
@@ -110,82 +170,222 @@
               'has-PartList': p.page_type === 'PART_LIST',
               'has-Vector': p.has_vector_text_region
             }"
-            :title="p.page_type_label + ': ' + p.title"
-            @click="currentPage = p.page_num"
+            :title="'第' + p.page_num + '页: ' + p.page_type_label + ' (' + p.title + ')'"
+            :aria-label="'跳转第' + p.page_num + '页'"
+            :aria-current="currentPage === p.page_num ? 'page' : null"
+            @click="changePage(p.page_num)"
           >
             P{{ p.page_num }}{{ p.page_type === 'PART_LIST' ? '(表)' : (p.has_vector_text_region ? '(视)' : '') }}
-          </span>
+          </button>
         </div>
 
-        <!-- PDF Image + Highlighting Overlay -->
-        <div class="pdf-canvas-viewport">
-          <div class="pdf-stage-wrapper" :style="{ width: zoomPercent + '%' }">
-            <img :src="pageImageUrl" class="pdf-page-img" alt="PDF Page" />
-            <div
-              v-if="activeBox && activeBox.page === currentPage && activeBox.norm_bbox"
-              class="bbox-highlight"
-              :style="{
-                left: (activeBox.norm_bbox[0] * 100) + '%',
-                top: (activeBox.norm_bbox[1] * 100) + '%',
-                width: Math.max(3, (activeBox.norm_bbox[2] - activeBox.norm_bbox[0]) * 100) + '%',
-                height: Math.max(2.5, (activeBox.norm_bbox[3] - activeBox.norm_bbox[1]) * 100) + '%'
-              }"
-            >
-              <div class="bbox-label">{{ activeBox.label }}</div>
+        <!-- Interactive Pan & Wheel-Zoom PDF Canvas Shell -->
+        <div class="pdf-canvas-shell">
+          <div
+            ref="pdfViewportRef"
+            class="pdf-canvas-viewport"
+            :class="{ panning: isPanning, 'draw-mode': isDrawBoxMode }"
+            @wheel.prevent="handleCanvasWheel"
+            @mousedown="startPan"
+            @mousemove="movePan"
+            @mouseup="endPan"
+            @mouseleave="endPan"
+            @dblclick="handleCanvasDblClick"
+          >
+            <div ref="pdfStageRef" class="pdf-stage-wrapper" :style="{ width: zoomPercent + '%' }">
+              <div v-if="pageImageReady && showDrawingGrid && pageGridBands.length" class="drawing-grid-ruler" aria-label="图纸分栏标尺">
+                <button v-for="band in pageGridBands" :key="'ruler-' + band.number" type="button"
+                  :class="{ active:activeGridColumn?.page === currentPage && activeGridColumn.number === band.number }"
+                  :style="{left:(band.left*100)+'%',width:((band.right-band.left)*100)+'%'}"
+                  :title="'第 ' + band.number + ' 栏 · 点击定位'" :aria-label="'定位图纸第' + band.number + '栏'"
+                  @mousedown.stop @click.stop="focusDrawingColumn(band.number)">{{ band.number }}</button>
+              </div>
+              <img :key="pageImageUrl" :src="displayedPageImageUrl" :width="currentPageInfo?.width || undefined" :height="currentPageInfo?.height || undefined" class="pdf-page-img" :class="{ 'page-image-loading': !pageImageReady }" alt="PDF Page" @load="onPageImageLoad" @error="onPageImageError" />
+              <div v-if="pageImageReady && showDrawingGrid && pageGridBands.length" class="drawing-grid-guides" aria-hidden="true">
+                <div v-for="band in pageGridBands" :key="'guide-' + band.number" class="drawing-grid-band"
+                  :class="{ active:activeGridColumn?.page === currentPage && activeGridColumn.number === band.number }"
+                  :style="{left:(band.left*100)+'%',width:((band.right-band.left)*100)+'%'}"></div>
+              </div>
+              <div v-if="!pageImageReady" class="page-image-message" role="status"><span>{{ pageImageError || '正在加载本页图纸…' }}</span><button v-if="pageImageError" class="text-button" @click="retryPageImage">重新加载</button></div>
+
+              <!-- Live User-Drawn Selection Box -->
+              <div
+                v-if="pageImageReady && drawingBoxRect"
+                class="manual-draw-rect"
+                :style="{
+                  left: (drawingBoxRect[0] * 100) + '%',
+                  top: (drawingBoxRect[1] * 100) + '%',
+                  width: ((drawingBoxRect[2] - drawingBoxRect[0]) * 100) + '%',
+                  height: ((drawingBoxRect[3] - drawingBoxRect[1]) * 100) + '%'
+                }"
+              ></div>
+
+              <!-- Interactive Clickable SoM Candidate Boxes -->
+              <template v-if="pageImageReady && showSomLayer && filteredSomCandidates.length > 0">
+                <div
+                  v-for="cand in filteredSomCandidates"
+                  :key="currentProjectId + ':' + currentPage + ':' + cand.key"
+                  class="som-box-overlay"
+                  :class="['som-' + cand.kind, { 'som-table-row': cand.detector_source === 'PARTS_TABLE_ROW', 'is-selected': highlightedCandidateKey === cand.key, 'som-details-left': cand.norm_bbox[0] > .65, 'som-details-above': cand.norm_bbox[1] > .7 }]"
+                  role="button" tabindex="0"
+                  :aria-pressed="highlightedCandidateKey === cand.key"
+                  :aria-label="cand.status + '：' + (cand.display_label || cand.tag || cand.som_label)"
+                  :style="{
+                    left: (cand.norm_bbox[0] * 100) + '%',
+                    top: (cand.norm_bbox[1] * 100) + '%',
+                    width: ((cand.norm_bbox[2] - cand.norm_bbox[0]) * 100) + '%',
+                    height: ((cand.norm_bbox[3] - cand.norm_bbox[1]) * 100) + '%'
+                  }"
+                  :title="cand.status + ' · ' + (cand.tag || cand.som_label) + '\n' + cand.reason"
+                  @mousedown.stop
+                  @click.stop="selectSomCandidate(cand)"
+                  @keydown.enter.stop.prevent="selectSomCandidate(cand)"
+                  @keydown.space.stop.prevent="selectSomCandidate(cand)"
+                >
+                  <div class="som-box-badge"><template v-if="pageOrderActive && pagePositions.has(cand.matched_item_id)">{{ pagePositions.get(cand.matched_item_id).number }} · </template>{{ cand.display_label || cand.tag || '[' + cand.som_label + ']' }}</div>
+                  <span v-if="focusedCandidate?.key === cand.key" class="bbox-corner-close" aria-hidden="true" title="取消定位">✕</span>
+                  <div class="som-box-details"><strong>{{ cand.status }}</strong><span v-if="cand.item_name">{{ cand.item_name }}<template v-if="cand.item_model"> · {{ cand.item_model }}</template></span><small v-if="cand.table_members?.length > 1">对应位号：{{ (cand.table_member_labels || cand.table_members).join('、') }}</small><template v-if="['pending','excluded'].includes(cand.kind)"><span>{{ cand.reason }}</span><small v-if="cand.nearby_texts?.length">原图文字：{{ cand.nearby_texts.slice(0, 4).join(' · ') }}</small></template></div>
+                </div>
+              </template>
+              <button v-for="link in pageImageReady ? crossPageLinks : []" :key="'cross-' + link.key"
+                type="button" class="cross-page-link"
+                :style="{left:(link.evidence.norm_bbox[0]*100)+'%',top:(link.evidence.norm_bbox[1]*100)+'%'}"
+                :title="'跳转图纸第' + link.sheet + '页 · 第' + link.column + '栏'"
+                :aria-label="link.item.tag + ' 跳转图纸第' + link.sheet + '页第' + link.column + '栏'"
+                @mousedown.stop @click.stop="jumpToCrossReference(link)">↗ {{ link.sheet }}.{{ link.column }}</button>
+              <div v-if="pageImageReady && showSomLayer && (topologyLoading || topologyError || !somCounts.ALL)" class="som-page-status" role="status" @mousedown.stop>
+                <span v-if="topologyLoading">正在读取本页候选框…</span>
+                <template v-else-if="topologyError"><span>{{ topologyError }}</span><button class="text-button" @click="loadPageTopology">重试</button></template>
+                <span v-else>本页暂无有效候选<template v-if="somCounts.excluded">，已排除 {{ somCounts.excluded }} 处可疑标注，可在图例中查看</template>。</span>
+              </div>
+
+              <div
+                v-for="(terminal, idx) in terminalHighlights"
+                :key="'terminal-' + idx"
+                class="terminal-position-highlight"
+                :style="drawingBoxStyle(terminal.norm_bbox, .008, .011)"
+                :title="'端子 ' + terminal.raw_text"
+              ></div>
+
+              <!-- Active Selected BOM Row Highlight Box -->
+              <div
+                v-if="pageImageReady && !focusedCandidate && activeBox && activeBox.project_id === currentProjectId && activeBox.view_mode === currentImageView && activeBox.page === currentPage && activeBox.norm_bbox"
+                class="bbox-highlight"
+                :style="drawingBoxStyle(activeBox.norm_bbox, .028, .025)"
+              >
+                <!-- Corner Close Button: only close button, 16px small, Esc shortcut -->
+                <div
+                  class="bbox-corner-close"
+                  @click.stop="clearActiveBox"
+                  @mousedown.stop
+                  title="关闭高亮 (快捷键 Esc)"
+                >
+                  ✕
+                </div>
+
+                <!-- Label Badge: pure text label, no inner close button -->
+                <div
+                  class="bbox-label"
+                  @mousedown.stop
+                >
+                  <span>{{ activeBox.label }}</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        <!-- Cross-Page Evidence Jumper Bar -->
-        <div class="evidence-jumper-bar" v-if="selectedEvidences && selectedEvidences.length > 0">
-          <span>📍 当前器件跨页关联位置 ({{ selectedEvidences.length }}处)：</span>
-          <span
-            v-for="(ev, idx) in selectedEvidences"
-            :key="idx"
-            class="ev-chip"
-            :class="{ active: currentPage === ev.page }"
-            @click="selectEvidence(ev)"
-          >
-            第{{ ev.page }}页 ({{ ev.role === 'table_row' ? '部件列表行' : (ev.role === 'main_circuit' ? '主回路' : '原理图符号') }}: {{ ev.raw_text.slice(0, 18) }})
+        <!-- Compact Single-Line Cross-Page Evidence Jumper Bar -->
+        <div class="evidence-jumper-bar" v-if="displayedEvidences.length > 0">
+          <span style="white-space:nowrap; font-weight:700; color:#94a3b8;">
+            📍 定位 ({{ currentEvIndex + 1 }}/{{ displayedEvidences.length }})：
           </span>
+          <button class="hud-btn" @click="stepEvidence(-1)" title="上一处位置">◀</button>
+          <select class="ev-select" :value="currentEvIndex" @change="selectEvidenceByIndex(Number($event.target.value))">
+            <option v-for="(ev, idx) in displayedEvidences" :key="idx" :value="idx">
+              [{{ idx + 1 }}] 第{{ ev.page }}页 · {{ ev.raw_text.slice(0, 18) }}
+            </option>
+          </select>
+          <button class="hud-btn" @click="stepEvidence(1)" title="下一处位置">▶</button>
+          <button class="hud-btn" @click="panCenterToActiveBox" title="平移居中到当前位号 (保持您当前滚轮缩放比例不变)">🎯 居中</button>
+
+          <button
+            v-if="!pageOrderActive && selectedEvidences.length > uniqueTagEvidences.length"
+            class="hud-btn"
+            :class="{ active: evDedupeByTag }"
+            @click="evDedupeByTag = !evDedupeByTag; currentEvIndex = 0"
+            :title="selectedItemObj?.terminal_strip_tag ? '切换端子位置证据与全部文字证据' : '同位号的线圈与辅助触点只保留1处主位置'"
+          >
+            {{ evDedupeByTag ? (selectedItemObj?.terminal_strip_tag ? `端子位置(${uniqueTagEvidences.length}处)` : `✨ 按位号去重(${uniqueTagEvidences.length}个)`) : `全部(${selectedEvidences.length}处)` }}
+          </button>
+
+          <div
+            class="ev-scroll-strip"
+            @wheel.prevent="handleEvScrollWheel"
+            title="横向滚轮滑动查看所有位号坐标"
+          >
+            <span
+              v-for="(ev, idx) in displayedEvidences"
+              :key="idx"
+              class="ev-chip"
+              :class="{ active: currentEvIndex === idx }"
+              @click="selectEvidenceByIndex(idx)"
+            >
+              P{{ ev.page }}:{{ ev.raw_text.slice(0, 12) }}
+            </span>
+          </div>
         </div>
 
         <!-- NetworkX Vertical Branch Chains Bar (when SoM layer is active) -->
-        <div class="evidence-jumper-bar" v-if="showSomLayer && pageTopology && pageTopology.branches && pageTopology.branches.length > 0" style="background:#0f172a; color:#f8fafc; border-top:1px solid #334155;">
-          <span style="color:#38bdf8; font-weight:700;">
-            🕸️ NetworkX 矢量追线 ({{ pageTopology.wire_segment_count }}根导线 / {{ pageTopology.candidates.length }}个 SoM [#编号] 候选框)：
+        <div class="evidence-jumper-bar" v-if="showSomLayer && visibleSomBranches.length > 0" style="background:#0f172a; color:#f8fafc; border-top:1px solid #334155;">
+          <span style="color:#38bdf8; font-weight:700; white-space:nowrap;">
+            🕸️ 支路链 ({{ filteredSomCandidates.length }}框)：
           </span>
-          <span
-            v-for="b in pageTopology.branches.slice(0, 8)"
-            :key="b.branch_id"
-            class="ev-chip"
-            style="background:#1e293b; color:#e2e8f0; border-color:#475569;"
-            :title="b.chain.join(' -> ')"
-          >
-            {{ b.branch_id }}: {{ b.node_labels.join('→') }}
-          </span>
+          <div class="ev-scroll-strip">
+            <span
+              v-for="b in visibleSomBranches.slice(0, 10)"
+              :key="b.branch_id"
+              class="ev-chip"
+              style="background:#1e293b; color:#e2e8f0; border-color:#475569;"
+              :title="b.chain.join(' -> ')"
+            >
+              {{ b.branch_id }}: {{ b.node_labels.join('→') }}
+            </span>
+          </div>
         </div>
       </section>
 
+      <!-- Draggable Vertical Splitter -->
+      <div
+        class="pane-splitter"
+        v-show="workspaceMode === 'compare'"
+        :class="{ dragging: isResizingSplit }"
+        title="左右拖动调节图纸与表格宽度"
+        @mousedown="startSplitResize"
+      ></div>
+
       <!-- Right: Editable BOM Table & Review Queue -->
-      <section class="table-pane">
+      <section class="table-pane" v-show="workspaceMode !== 'drawing'">
         <!-- Tabs Header -->
         <div class="tabs-header">
           <div class="tab-btn-group">
             <button class="tab-btn" :class="{ active: activeTab === 'primary' }" @click="activeTab = 'primary'">
-              {{ isPartListMode ? '📑 部件清单明细 (主表)' : '📋 BOM 采购汇总表 (主表)' }}
+              {{ isTableExtraction ? '部件表提取' : isPartListMode ? '部件清单' : '采购汇总' }}
               <span class="badge-count">{{ primaryBomList.length }}</span>
             </button>
 
-            <button class="tab-btn" :class="{ active: activeTab === 'secondary' }" @click="activeTab = 'secondary'">
-              {{ isPartListMode ? '📋 按型号合并采购汇总' : '📑 按位号展开视图' }}
+            <button v-if="!isTableExtraction" class="tab-btn" :class="{ active: activeTab === 'secondary' }" @click="activeTab = 'secondary'">
+              {{ isPartListMode ? '采购汇总' : '位号明细' }}
               <span class="badge-count">{{ secondaryBomList.length }}</span>
             </button>
 
+            <button v-if="!isPartListMode && !isTableExtraction" class="tab-btn" :class="{ active: activeTab === 'inventory' }" @click="openInventory">位号盘点<span v-if="deviceInventory" class="badge-count">{{ deviceInventory.total_devices }}</span></button>
+
             <button class="tab-btn" :class="{ active: activeTab === 'reviews' }" @click="activeTab = 'reviews'">
-              🔍 待审核与交叉校验
-              <span class="badge-count danger">{{ pendingReviewCount }} / {{ projectData.review_items.length }}</span>
+              采购待核
+              <span class="badge-count danger">{{ awaitingFirstBom && !pendingReviewCount ? '分析中' : pendingReviewCount }}</span>
             </button>
+            <button v-if="independentInfo" class="tab-btn" :class="{ active: activeTab === 'reconciliation' }" @click="activeTab = 'reconciliation'">清单核对 <span class="badge-count">{{ pendingReconciliation.length }}</span></button>
 
             <button
               v-if="projectData.filtered_items && projectData.filtered_items.length > 0"
@@ -193,165 +393,85 @@
               :class="{ active: activeTab === 'filtered' }"
               @click="activeTab = 'filtered'"
             >
-              🗑️ 已过滤备查
+              范围外备查
               <span class="badge-count">{{ projectData.filtered_items.length }}</span>
             </button>
           </div>
 
-          <button class="btn btn-primary btn-sm" @click="openAddModal">➕ 新增物料行</button>
+          <button class="btn btn-primary btn-sm" @click="openAddModal">＋ 新增物料</button>
         </div>
 
-        <!-- Search & Filter Toolbar (for BOM tables) -->
         <div class="filter-toolbar" v-if="activeTab === 'primary' || activeTab === 'secondary'">
-          <input
-            type="text"
-            class="search-input"
-            v-model="searchQuery"
-            placeholder="🔍 搜索位号(-QF1 / =02-K1)、名称(接触器/断路器)、型号(LC1D / 6ES7)、品牌(施耐德)..."
-          />
-          <select class="source-filter-select" v-model="sourceFilter">
-            <option value="ALL">全部数据来源</option>
-            <option value="EXPLICIT">原图明文</option>
-            <option value="TOPOLOGY_INFERRED">拓扑推导</option>
-            <option value="RULE_COMPLETED">规则补全</option>
-            <option value="ESTIMATED_AUX">工程估算</option>
-            <option value="MANUAL_EDITED">人工已改</option>
-          </select>
-          <span style="font-size:12px; color:#64748b;">💡 点击任意行左侧图纸自动高亮定位；双击或点【修改】可直接在线编辑</span>
+          <div class="search-field"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.6"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><input type="search" class="search-input" aria-label="搜索物料" v-model="searchQuery" placeholder="搜索位号、名称、型号或原图参数" /><kbd>/</kbd></div>
+          <div class="filter-controls">
+            <select v-if="activeTab === detailTab" v-model="followDrawingPage" @change="clearActiveBox" aria-label="明细显示范围"><option :value="true">跟随图页 · P{{ currentPage }}</option><option :value="false">全部图页</option></select>
+            <select v-if="pageOrderActive && circuitPageOrder" v-model="pageOrderMode" @change="clearActiveBox" aria-label="单页图序"><option value="circuit">按图格 · 左到右</option><option value="visual">按位置 · 上到下</option></select>
+            <select aria-label="物料分类" v-model="categoryFilter"><option value="ALL">全部分类</option><option value="PRIMARY">核心电气元件 · {{ primaryCatCount }}</option><option value="AUX">导线 / 端子 / 柜体 · {{ auxCatCount }}</option></select>
+            <select aria-label="审核状态筛选" v-model="issueFilter"><option value="ALL">全部审核状态</option><option value="MODEL">待选型</option><option value="QUANTITY">数量待核</option><option value="SCOPE">范围待核</option><option value="REVIEW">待审核</option></select>
+            <select aria-label="数据来源筛选" v-model="sourceFilter"><option value="ALL">全部来源</option><option value="EXPLICIT">{{ isTableExtraction ? '部件表原文' : '原图明文' }}</option><option value="UNRESOLVED">型号待核实</option><option value="VISION_RECOGNIZED">视觉提取</option><option value="TOPOLOGY_INFERRED">拓扑推导</option><option value="RULE_COMPLETED">规则补全</option><option value="MANUAL_EDITED">人工已改</option></select>
+            <button v-if="filtersActive" class="text-button" @click="resetFilters">清除筛选</button><span class="result-count">{{ currentTableItems.length }} / {{ tableScopeItems.length }} 项</span>
+          </div>
         </div>
-
-        <!-- Tab 1 & 2: Editable BOM Table -->
-        <div class="table-scroll-container" v-if="activeTab === 'primary' || activeTab === 'secondary'">
-          <table class="bom-table">
-            <thead>
-              <tr>
-                <th style="width:46px;">序号</th>
-                <th style="width:120px;">位号/标识符</th>
-                <th style="width:90px;">品牌/制造商</th>
-                <th style="width:120px;">名称/描述</th>
-                <th>型号 / 订货编号</th>
-                <th style="width:52px;">单位</th>
-                <th style="width:62px;">数量</th>
-                <th style="width:95px;">备注</th>
-                <th style="width:82px;">图纸页码</th>
-                <th style="width:76px;">来源</th>
-                <th style="width:105px;">操作</th>
-              </tr>
-            </thead>
+        <div class="table-scroll-container primary-table-scroll" :key="pageOrderActive ? 'page-' + currentPage : activeTab" v-if="activeTab === 'primary' || activeTab === 'secondary'">
+          <table class="bom-table procurement-table" aria-label="BOM物料清单">
+            <colgroup><col class="col-seq"/><col class="col-device"/><col class="col-model"/><col class="col-quantity"/><col class="col-status"/><col class="col-page"/><col class="col-actions"/></colgroup>
+            <thead><tr><th scope="col" :title="pageOrderActive ? useCircuitOrder ? '本页先按图格列从左到右，再在列内从上到下；布置图与清单页按位置排序' : '本页从上到下，同一行从左到右' : '清单序号'">{{ pageOrderActive ? '图序' : '序号' }}</th><th scope="col">物料 / 位号</th><th scope="col">型号与原图参数</th><th scope="col">数量</th><th scope="col">采购待办</th><th scope="col">图纸</th><th scope="col">操作</th></tr></thead>
             <tbody>
-              <tr
-                v-for="item in currentTableItems"
-                :key="item.id"
-                :class="{
-                  'selected-row': selectedItemId === item.id,
-                  'editing-row': editingId === item.id
-                }"
-                @click="selectBomRow(item)"
-                @dblclick="startEdit(item)"
-              >
-                <td><strong>{{ item.seq_no }}</strong></td>
-
-                <!-- Tag -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.tag" @click.stop />
-                  <span v-else style="font-family:Consolas,monospace; font-size:12px; color:#1e40af;">{{ item.tag }}</span>
-                </td>
-
-                <!-- Brand -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.brand" @click.stop />
-                  <span v-else>{{ item.brand }}</span>
-                </td>
-
-                <!-- Name -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.name" @click.stop />
-                  <span v-else style="font-weight:600;">{{ item.name }}</span>
-                </td>
-
-                <!-- Model -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.model" @click.stop />
-                  <div v-else>
-                    <span style="font-family:Consolas,monospace; font-weight:600; color:#0f172a;">{{ item.model }}</span>
-                    <div v-if="item.review_note" style="font-size:11px; color:#64748b; margin-top:2px;">
-                      {{ item.review_note }}
-                    </div>
-                  </div>
-                </td>
-
-                <!-- Unit -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.unit" @click.stop />
-                  <span v-else>{{ item.unit }}</span>
-                </td>
-
-                <!-- Quantity -->
-                <td>
-                  <input
-                    v-if="editingId === item.id"
-                    type="number"
-                    step="any"
-                    class="inline-input"
-                    v-model="editForm.quantity"
-                    @click.stop
-                  />
-                  <strong v-else style="color:#0f172a; font-size:13px;">{{ item.quantity }}</strong>
-                </td>
-
-                <!-- Remark -->
-                <td>
-                  <input v-if="editingId === item.id" class="inline-input" v-model="editForm.remark" @click.stop />
-                  <span v-else style="color:#475569; font-size:12px;">{{ item.remark }}</span>
-                </td>
-
-                <!-- Page -->
-                <td>
-                  <span style="color:#2563eb; text-decoration:underline; font-size:12px;">
-                    {{ item.pdf_page_label || ('第' + item.primary_page + '页') }}
-                  </span>
-                </td>
-
-                <!-- Source badge -->
-                <td>
-                  <span class="src-badge" :class="'src-' + item.source_type">
-                    {{ sourceLabel(item.source_type) }}
-                  </span>
-                </td>
-
-                <!-- Actions -->
-                <td @click.stop>
-                  <template v-if="editingId === item.id">
-                    <button class="btn btn-success btn-sm" @click="saveEdit(item)">保存</button>
-                    <button class="btn btn-light btn-sm" style="margin-left:4px;" @click="cancelEdit">取消</button>
-                  </template>
-                  <template v-else>
-                    <button class="btn btn-light btn-sm" @click="startEdit(item)">修改</button>
-                    <button class="btn btn-danger-light btn-sm" style="margin-left:4px;" @click="deleteBomRow(item)">删</button>
-                  </template>
-                </td>
+              <tr v-for="item in currentTableItems" :key="item.id" :id="'bom-row-' + item.id" :class="{ 'selected-row':selectedItemId === item.id }" @click="selectBomRow(item)" @dblclick="startEdit(item)">
+                <td class="seq-cell">{{ pageOrderActive ? pagePositions.get(item.id).number : item.seq_no }}</td>
+                <td><div class="device-name" :title="item.name">{{ item.name || '未命名物料' }}</div><div class="tag-cell" :title="item.tag">{{ item.tag || '无独立位号' }}</div><div class="device-brand" v-if="item.brand && item.brand !== '待定'" :title="item.brand">{{ item.brand }}</div></td>
+                <td><span v-if="needsModel(item)" class="status-chip chip-amber" :title="item.model">待选型</span><div v-else class="model-code" :title="item.model">{{ item.model }}</div><div v-if="hasDistinctSpecification(item)" class="spec-line" :title="item.specification">{{ item.specification }}</div><div class="model-meta"><span class="source-dot" :class="'source-' + item.source_type"></span>{{ sourceLabel(item.source_type) }}<span v-if="item.model_origin === 'drawing_parts_list_confirmed'"> · 采纳原表型号</span><span v-if="item.model_origin === 'mixed'"> · 混合采用来源</span><span v-if="item.parent_tag"> · 含组件关系</span><span v-if="item.selection_suggestions?.some(s => s.status === 'PENDING')"> · 有选型建议</span></div></td>
+                <td class="quantity-cell"><span v-if="item.quantity == null" class="quantity-pending">待核定</span><template v-else><strong>{{ item.quantity }}</strong><span class="quantity-unit">{{ item.unit }}</span></template><div v-if="item.quantity_candidates?.length" class="quantity-candidates">候选 {{ item.quantity_candidates.join(' / ') }}</div></td>
+                <td><div class="issue-chips"><span v-for="issue in itemIssues(item).slice(0,2)" :key="issue" class="status-chip" :class="issue === '范围待核' ? 'chip-blue' : 'chip-amber'">{{ issue }}</span><button v-if="itemIssues(item).length > 2" class="chip-more" @click.stop="openItemDetails(item)" :aria-label="'查看第' + item.seq_no + '项全部待办'">＋{{ itemIssues(item).length - 2 }}</button><span v-if="!itemIssues(item).length" class="status-chip chip-green">已审核</span></div></td>
+                <td><button class="page-link" :title="item.pdf_page_label" @click.stop="locateItem(item)">P{{ pageOrderActive ? currentPage : item.primary_page || 1 }}</button><small v-if="evidencePages(item).length > 1" class="extra-pages">共 {{ evidencePages(item).length }} 页</small></td>
+                <td class="row-actions" @click.stop><button class="text-button" @click="openItemDetails(item)" :aria-label="'查看第' + item.seq_no + '项详情'">详情</button><button class="text-button" @click="startEdit(item)" :aria-label="'编辑第' + item.seq_no + '项'">编辑</button></td>
               </tr>
             </tbody>
           </table>
+          <div v-if="!currentTableItems.length" class="table-empty"><div class="empty-search-icon" aria-hidden="true">⌕</div><h3>{{ awaitingFirstBom ? '正在识别图中设备' : pageOrderActive && !tableScopeItems.length ? 'P' + currentPage + ' 暂无已定位的清单项' : baseBomList.length ? '没有符合条件的物料' : '当前还没有物料' }}</h3><p v-if="awaitingFirstBom">可继续看图，识别完成后会自动显示清单。</p><button v-else-if="pageOrderActive && !tableScopeItems.length" class="text-button" @click="followDrawingPage = false; clearActiveBox()">查看全部图页明细</button><button v-if="filtersActive" class="btn btn-light" @click="resetFilters">清除筛选条件</button></div>
+        </div>
+        <div v-if="activeTab === 'primary' || activeTab === 'secondary'" class="table-footer"><span>{{ pageOrderActive ? 'P' + currentPage + ' · ' : '' }}显示 {{ currentTableItems.length }} 项<span v-if="issueFilter !== 'ALL'"> · {{ issueLabels[issueFilter] }}</span></span><span>{{ pageOrderActive ? useCircuitOrder ? '图格列：先左后右，列内从上到下' : '从上到下，同一行从左到右' : '单击对照原图 · 双击编辑' }}</span></div>
+
+
+        <div v-if="activeTab === 'inventory'" class="table-scroll-container primary-table-scroll">
+          <div class="filter-toolbar"><label>位号类别 <select v-model="inventoryFamily" aria-label="位号类别"><option value="ALL">全部</option><option v-for="family in inventoryFamilies" :key="family" :value="family">{{ family }}</option></select></label><span>{{ inventoryItems.length }} 项</span></div>
+          <div v-if="inventoryLoading" class="table-empty">正在盘点图纸位号…</div>
+          <table v-else class="bom-table" aria-label="全图位号盘点"><thead><tr><th>位号</th><th>型号</th><th>数量</th><th>所在图页</th></tr></thead><tbody>
+            <tr v-for="item in inventoryItems" :key="item.tag"><td><button class="page-link" @click="locateInventoryItem(item)">{{ item.tag }}</button></td><td>{{ item.model || '待核实' }}</td><td>{{ item.quantity == null ? '待核实' : item.quantity }}</td><td>{{ [...new Set(item.occurrences.map(entry => 'P' + entry.page))].join('、') }}</td></tr>
+          </tbody></table>
+          <div v-if="!inventoryLoading && !inventoryItems.length" class="table-empty">当前类别没有找到位号</div>
+        </div>
+
+
+        <div v-if="activeTab === 'reconciliation'" class="table-scroll-container reconciliation-panel">
+          <div class="reconciliation-intro"><strong>两份独立结果，逐项核对</strong><p>左侧来自屏蔽物料表后的原理图，右侧保留图内清单原文。字段一致不代表已完成采购审核。人工采纳只修改采购明细。</p><p v-if="projectData.summary.declared_reference_status !== 'loaded'" class="task-error">{{ projectData.summary.declared_reference_status === 'absent' ? '未检测到图内物料表，当前保留独立识别结果。' : '图内清单未能完整读取，请检查原表。' }}</p><div class="reconciliation-counts"><span>独立快照 {{ projectData.independent_bom.length }} 项</span><span>原表 {{ projectData.declared_parts.length }} 行</span><span>待处理 {{ projectData.summary.reconciliation?.pending || 0 }} 项</span></div><label>核对筛选 <select v-model="reconciliationFilter" aria-label="清单核对筛选"><option value="PENDING">待处理</option><option value="ALL">全部核对记录</option><option v-for="(label, key) in reconciliationLabels" :key="key" :value="key">{{ label }}</option></select></label></div>
+          <article v-for="row in reconciliationRows" :key="row.id" class="reconciliation-card"><div class="reconciliation-card-head"><strong>{{ reconciliationLabels[row.status] }}</strong><span class="status-chip" :class="row.decision === 'PENDING' ? 'chip-amber' : 'chip-green'">{{ decisionLabel(row.decision) }}</span></div><div class="comparison-columns"><section><h3>{{ row.status === 'TABLE_ACCESSORY' ? '原理图所属主件' : '原理图独立识别' }}</h3><div v-if="!row.schematic.length" class="comparison-empty">尚未找到对应的原理图证据</div><div v-for="fact in row.schematic" :key="fact.id" class="comparison-fact"><strong>{{ fact.tag || '无独立位号' }} · {{ fact.name }}</strong><code>{{ fact.model || '型号未确定' }}</code><p v-if="fact.specification">{{ fact.specification }}</p><span>数量：{{ fact.quantity == null ? '待核定' : fact.quantity }} {{ fact.unit }}</span><button v-if="fact.evidences.length" class="page-link" @click="locateComparison(fact, false)">原理图证据 P{{ fact.evidences[0].page }}</button></div></section><section><h3>图内清单原文</h3><div v-if="!row.declared.length" class="comparison-empty">原表未建立对应记录</div><div v-for="fact in row.declared" :key="fact.id" class="comparison-fact"><strong>{{ fact.tag || '无独立位号' }} · {{ fact.name }}</strong><code>{{ fact.model || '型号未确定' }}</code><p v-if="fact.raw_model && fact.raw_model !== fact.model">原文：{{ fact.raw_model }}</p><p v-if="fact.specification">{{ fact.specification }}</p><p v-if="fact.remark">{{ fact.remark }}</p><span>原表数量：{{ fact.quantity == null ? '未注明' : fact.quantity }} {{ fact.unit }}</span><button v-if="fact.evidences.length" class="page-link" @click="locateComparison(fact, true)">原表证据 P{{ fact.evidences[0].page }}</button></div></section></div><ul class="comparison-reasons"><li v-for="reason in row.reasons" :key="reason">{{ reason }}</li></ul><div v-if="row.previous_decision && row.decision === 'PENDING'" class="task-error">识别依据更新，原处理需要重新核对。</div><div class="comparison-actions"><button class="text-button" :disabled="reconciliationBusy" @click="handleReconciliation(row, 'CONFIRM')">确认已核对</button><button v-if="row.schematic.length" class="text-button" :disabled="reconciliationBusy" @click="handleReconciliation(row, 'KEEP_SCHEMATIC')">保留原理图结果</button><button v-if="canAdoptReference(row)" class="btn btn-light btn-sm" :disabled="reconciliationBusy" @click="handleReconciliation(row, 'ADOPT_MODEL')">人工采纳原表型号</button><button v-if="['TABLE_ONLY','UNLINKED_REFERENCE','TABLE_ACCESSORY'].includes(row.status) && row.decision !== 'ADD_REFERENCE'" class="btn btn-light btn-sm" :disabled="reconciliationBusy" @click="handleReconciliation(row, 'ADD_REFERENCE')">人工补入采购明细</button></div></article>
+          <div v-if="!reconciliationRows.length" class="table-empty"><h3>当前没有这类核对记录</h3><p>切换筛选可查看已处理记录和原表。</p></div>
         </div>
 
         <!-- Tab 3: Review & Cross-Verification Queue -->
         <div class="table-scroll-container" v-if="activeTab === 'reviews'">
-          <div class="review-list">
+          <div class="review-toolbar"><button class="text-button" @click="reviewStatusFilter='PENDING'">采购待核 {{ pendingReviewCount }}</button><button class="text-button" @click="reviewStatusFilter='COVERAGE'">待核图页 {{ pagesToCheck.length }}</button><select aria-label="审核队列状态" v-model="reviewStatusFilter"><option value="PENDING">采购问题</option><option value="COVERAGE">图页核查</option><option value="ACCEPTED">已采纳</option><option value="IGNORED">已忽略</option><option value="ALL">全部原始记录</option></select></div>
+          <p v-if="awaitingFirstBom && reviewStatusFilter==='PENDING'" class="review-import-note">AI 正在建立设备清单，已处理 {{ aiJob?.completed_pages || 0 }}/{{ aiJob?.total_pages || projectData.page_count }} 页。合并后会显示需要核查的图页。</p>
+          <div v-if="pagesToCheck.length && reviewStatusFilter==='COVERAGE'" class="review-import-note">定位图页
+            <button v-for="page in pagesToCheck" :key="page" class="text-button" @click="changePage(page)">P{{ page }}</button>
+          </div>
+          <p v-if="visibleReviews.some(isProjectReview)" class="review-import-note">其中 {{ visibleReviews.filter(isProjectReview).length }} 条为 CAD 导入质量提醒，涉及预览、兼容性或图框范围，不表示对应数量的物料识别错误。</p>
+          <div class="review-list"><div v-if="!visibleReviews.length && !awaitingFirstBom" class="table-empty"><h3>当前没有这类审核事项</h3><p>可以切换状态查看已处理记录。</p></div>
             <div
-              v-for="rev in projectData.review_items"
+              v-for="rev in visibleReviews"
               :key="rev.id"
               class="review-card"
               :class="['sev-' + rev.severity, rev.status !== 'PENDING' ? 'status-done' : '']"
-              @click="selectReviewCard(rev)"
+              @click="rev.members ? (expandedReview = expandedReview === rev.id ? '' : rev.id) : selectReviewCard(rev)"
             >
               <div class="review-card-header">
                 <div style="display:flex; align-items:center; gap:8px;">
                   <span class="sev-tag" :class="rev.severity">
-                    {{ rev.severity === 'CONFLICT' ? '⚠️ 型号/位号冲突' : (rev.severity === 'WARNING' ? '🔍 疑似漏项/笔误' : 'ℹ️ 工程规则与推导说明') }}
+                    {{ isProjectReview(rev) ? 'ℹ️ CAD 导入提醒' : rev.severity === 'CONFLICT' ? '⚠️ 型号/位号冲突' : (rev.severity === 'WARNING' ? '🔍 疑似漏项/笔误' : 'ℹ️ 工程规则与推导说明') }}
                   </span>
                   <strong style="font-family:Consolas,monospace; color:#1e40af;">{{ rev.tag }}</strong>
-                  <span style="font-size:12px; color:#64748b;">📍 第 {{ rev.page }} 页</span>
+                  <span style="font-size:12px; color:#64748b;">{{ isProjectReview(rev) ? '项目级提醒 · 无具体元件位置' : '📍 第 ' + rev.page + ' 页' }}</span>
                 </div>
                 <span style="font-size:12px; font-weight:700;" :style="{ color: rev.status === 'ACCEPTED' ? '#16a34a' : (rev.status === 'IGNORED' ? '#64748b' : '#d97706') }">
                   {{ rev.status === 'ACCEPTED' ? '✅ 已采纳处理' : (rev.status === 'IGNORED' ? '已忽略' : '待人工确认') }}
@@ -363,9 +483,12 @@
               <div class="review-suggest">💡 <strong>处理建议：</strong>{{ rev.suggestion }}</div>
 
               <div class="review-actions" @click.stop>
-                <button class="btn btn-light btn-sm" @click="jumpToLocation(rev.page, rev.norm_bbox, rev.tag)">
-                  🎯 定位第 {{ rev.page }} 页坐标框
+                <button v-if="rev.members || unboundLocations(rev).length" class="btn btn-light btn-sm" @click="expandedReview = expandedReview === rev.id ? '' : rev.id">{{ expandedReview === rev.id ? '收起明细' : '展开证据' }}</button>
+                <button v-if="isProjectReview(rev)" class="btn btn-light btn-sm" @click="showCadImportInfo">查看导入说明</button>
+                <button v-else-if="canLocateReview(rev)" class="btn btn-light btn-sm" @click="jumpToLocation(rev.page, rev.norm_bbox, rev.tag)">
+                  🎯 放大定位第 {{ rev.page }} 页坐标框
                 </button>
+                <button v-else class="btn btn-light btn-sm" @click="jumpToLocation(rev.page, null, '')">查看第 {{ rev.page }} 页</button>
                 <button
                   v-if="rev.related_page"
                   class="btn btn-light btn-sm"
@@ -374,14 +497,14 @@
                   🔗 对比第 {{ rev.related_page }} 页
                 </button>
                 <button
-                  v-if="rev.status === 'PENDING'"
+                  v-if="rev.status === 'PENDING' && !rev.members"
                   class="btn btn-primary btn-sm"
                   @click="handleReviewAction(rev, 'ACCEPT')"
                 >
                   {{ rev.action_type === 'ADD_ITEM' ? '✅ 采纳并加入 BOM' : (rev.action_type === 'UPDATE_ITEM' ? '✅ 采纳并修正 BOM' : '✔️ 确认无误') }}
                 </button>
                 <button
-                  v-if="rev.status === 'PENDING'"
+                  v-if="rev.status === 'PENDING' && !rev.members"
                   class="btn btn-light btn-sm"
                   @click="handleReviewAction(rev, 'IGNORE')"
                 >
@@ -394,6 +517,16 @@
                 >
                   重置为待审
                 </button>
+              </div>
+              <div v-if="expandedReview === rev.id" @click.stop>
+                <div v-for="member in rev.members" :key="member.id" class="review-actions">
+                  <button class="text-button" @click="selectReviewCard(member)">{{ member.proposed_data?.name || member.tag || member.title }} · 定位</button>
+                  <span>{{ member.description }}</span>
+                  <details v-if="unboundLocations(member).length"><summary>文字位置</summary><button v-for="(entry,i) in unboundLocations(member)" :key="i" class="text-button" @click="jumpToLocation(member.page,entry.norm_bbox,entry.text)">{{ entry.text }}</button></details>
+                  <button class="text-button" @click="handleReviewAction(member,'ACCEPT')">{{ member.action_type === 'ADD_ITEM' ? '采纳并加入 BOM' : member.action_type === 'UPDATE_ITEM' ? '采纳并修正 BOM' : '确认此条' }}</button>
+                  <button class="text-button" @click="handleReviewAction(member,'IGNORE')">忽略此条</button>
+                </div>
+                <button v-for="(entry,i) in unboundLocations(rev)" :key="i" class="text-button" @click="jumpToLocation(rev.page,entry.norm_bbox,entry.text)">{{ entry.text }}</button>
               </div>
             </div>
           </div>
@@ -424,7 +557,7 @@
                 <td style="font-family:Consolas,monospace;">{{ fit.tag }}</td>
                 <td>{{ fit.name }}</td>
                 <td style="font-family:Consolas,monospace;">{{ fit.model }}</td>
-                <td>{{ fit.quantity }}</td>
+                <td>{{ fit.quantity ?? '待确认' }} {{ fit.unit }}</td>
                 <td>{{ fit.remark }}</td>
                 <td style="color:#64748b; font-size:12px;">{{ fit.review_note }}</td>
                 <td @click.stop>
@@ -437,14 +570,99 @@
       </section>
     </div>
 
-    <!-- Modal: Add BOM Row -->
+    <div v-if="drawerItem" class="item-panel-backdrop" @click.self="closeItemPanel">
+      <aside class="item-panel" role="dialog" aria-modal="true" aria-labelledby="item-panel-title">
+        <header class="item-panel-header"><div><span class="section-eyebrow">第 {{ drawerItem.seq_no }} 项物料</span><h2 id="item-panel-title" data-panel-heading tabindex="-1">{{ editingId ? '编辑物料' : '物料详情' }}</h2><span class="panel-tag">{{ drawerItem.tag || '无独立位号' }}</span></div><button class="icon-button" @click="closeItemPanel" :disabled="savingEdit" aria-label="关闭物料侧栏">×</button></header>
+        <form v-if="editingId" class="item-edit-form" @submit.prevent="saveEdit(drawerItem)">
+          <div class="item-panel-body"><p class="panel-notice">保存后同步更新位号明细与采购汇总。数量尚未核定时留空。</p><p v-if="editTargetChanged" class="panel-notice panel-alert">后台结果已更新。修改内容仍保留，请关闭后重新选择物料，避免覆盖变化。</p><div class="editor-grid">
+            <label class="editor-field full-field">名称<input id="bom-editor-name" v-model="editForm.name" placeholder="物料名称" :disabled="savingEdit"/></label>
+            <label class="editor-field full-field">位号 / 标识符<input v-model="editForm.tag" placeholder="例如 +MCC1-K1" :disabled="savingEdit"/></label>
+            <label class="editor-field full-field">采购型号<input class="mono-input" v-model="editForm.model" placeholder="待选型时保留待核实标记" :disabled="savingEdit"/></label>
+            <label class="editor-field full-field">原图参数<textarea rows="2" v-model="editForm.specification" placeholder="电压、电流、线径等原图参数" :disabled="savingEdit"></textarea></label>
+            <label class="editor-field">品牌<input v-model="editForm.brand" placeholder="尚未确定时留空" :disabled="savingEdit"/></label>
+            <label class="editor-field">单位<input v-model="editForm.unit" placeholder="个 / 片 / 米" :disabled="savingEdit"/></label>
+            <label class="editor-field">数量<input type="number" min="0" step="any" v-model="editForm.quantity" placeholder="待核定" :disabled="savingEdit"/><small>留空表示未知，0 表示明确为零。</small></label>
+            <label class="editor-field">采购范围<select v-model="editForm.procurement_scope" :disabled="savingEdit"><option value="unknown">范围待核</option><option value="cabinet">柜内采购</option><option value="field">现场采购</option><option value="excluded">不在采购范围</option></select></label>
+            <label class="editor-field">实体角色<select v-model="editForm.entity_role" :disabled="savingEdit"><option value="device">独立器件</option><option value="coil">线圈 / 器件</option><option value="contact">仅触点</option><option value="terminal">端子材料</option><option value="cable">电缆材料</option><option value="assembly">成套 / 组件待核</option><option value="accessory">附件</option></select></label>
+            <label class="editor-field">所属组件<input v-model="editForm.parent_tag" placeholder="无所属组件时留空" :disabled="savingEdit"/></label>
+            <label class="editor-field full-field">备注<textarea rows="3" v-model="editForm.remark" placeholder="补充选型依据或供货说明" :disabled="savingEdit"></textarea></label>
+          </div></div><footer class="item-panel-footer"><span>{{ savingEdit ? '正在保存…' : editDirty ? '有未保存的修改' : '修改后点击保存' }}</span><button type="button" class="btn btn-light" @click="cancelEdit" :disabled="savingEdit">取消</button><button type="submit" class="btn btn-primary" :disabled="savingEdit || editTargetChanged">{{ savingEdit ? '正在保存…' : '保存修改' }}</button></footer>
+        </form>
+        <template v-else><div class="item-panel-body">
+          <section class="detail-section"><h3>物料信息</h3><dl class="detail-grid"><div><dt>名称</dt><dd>{{ drawerItem.name || '未命名物料' }}</dd></div><div><dt>品牌</dt><dd>{{ drawerItem.brand || '待定' }}</dd></div><div class="full-field"><dt>采购型号</dt><dd class="model-code">{{ drawerItem.model || '待选型' }}</dd></div><div class="full-field" v-if="drawerItem.raw_model"><dt>图纸原始型号</dt><dd class="model-code">{{ drawerItem.raw_model }}</dd></div><div class="full-field"><dt>原图参数</dt><dd>{{ drawerItem.specification || '暂无已提取参数' }}</dd></div><div><dt>数量</dt><dd>{{ drawerItem.quantity ?? '待核定' }} {{ drawerItem.unit }}<small v-if="drawerItem.quantity_candidates?.length"> · 候选 {{ drawerItem.quantity_candidates.join(' / ') }}</small></dd></div><div><dt>采购范围</dt><dd>{{ scopeLabel(drawerItem.procurement_scope) }}</dd></div><div><dt>实体角色</dt><dd>{{ roleLabel(drawerItem.entity_role) }}</dd></div><div><dt>数据来源</dt><dd>{{ sourceLabel(drawerItem.source_type) }}</dd></div><div class="full-field" v-if="drawerItem.parent_tag"><dt>所属组件</dt><dd>{{ drawerItem.parent_tag }}</dd></div></dl></section>
+          <section class="detail-section" v-if="drawerItem.readiness?.issues?.length || drawerItem.review_note"><h3>待办与识别说明</h3><div class="issue-chips"><span v-for="issue in drawerItem.readiness?.issues || []" :key="issue" class="status-chip chip-amber">{{ issue }}</span></div><p class="detail-prose" v-if="drawerItem.review_note">{{ drawerItem.review_note }}</p></section>
+          <section class="detail-section" v-if="drawerItem.selection_suggestions?.some(s => s.status === 'PENDING')"><h3>选型建议</h3><div v-for="s in drawerItem.selection_suggestions.filter(s => s.status === 'PENDING')" :key="s.model" class="selection-proposal"><strong>{{ s.model }}</strong><p>{{ s.reason }}</p><button class="btn btn-light btn-sm" @click="applySelection(drawerItem,s,'ACCEPT')">人工采纳</button><button class="text-button" @click="applySelection(drawerItem,s,'IGNORE')">忽略</button></div></section>
+          <section class="detail-section" v-if="drawerItem.remark"><h3>采购备注</h3><p class="detail-prose">{{ drawerItem.remark }}</p></section>
+          <section class="detail-section"><h3>原图证据 <span>{{ (drawerItem.evidences || []).length }} 处</span></h3><div class="evidence-list"><button v-for="(ev,index) in drawerItem.evidences || []" :key="index" @click="locateItemEvidence(drawerItem,ev)"><span>P{{ ev.page }}</span><span>{{ ev.raw_text || '图纸位置' }}</span><span aria-hidden="true">↗</span></button><p v-if="!drawerItem.evidences?.length" class="detail-prose">当前没有附加证据框，可通过图纸补录。</p></div></section>
+        </div><footer class="item-panel-footer"><button class="text-button danger-text" v-if="activeTab !== 'filtered'" @click="deletePanelItem(drawerItem)">删除物料</button><span class="footer-spacer"></span><button class="btn btn-light" @click="closeItemPanel">关闭</button><button v-if="activeTab !== 'filtered'" class="btn btn-primary" @click="startEdit(drawerItem)">编辑物料</button></footer></template>
+      </aside>
+    </div>
+    <div v-if="loading && projectData" class="workbench-loading" role="status"><span class="loading-spinner"></span>{{ loadingMessage }}</div>
+    <div v-if="toastMessage" class="workspace-toast" role="status" aria-live="polite"><span>{{ toastMessage }}</span><button @click="toastMessage = ''" aria-label="关闭提示">×</button></div>
+
+    <!-- Modal: Add BOM Row / Interactive PDF Box Recognition -->
+    <div class="modal-backdrop" v-if="showUploadDialog" @click.self="cancelUpload">
+      <section class="modal-box workflow-dialog" role="dialog" aria-modal="true" aria-labelledby="upload-workflow-title">
+        <div class="modal-header"><span id="upload-workflow-title">选择图纸处理方式</span><button class="btn btn-outline btn-sm" @click="cancelUpload" aria-label="取消上传">✕</button></div>
+        <div class="modal-body"><p class="workflow-file">{{ pendingUpload?.name }}</p><div class="workflow-options">
+          <label :class="{ selected: uploadWorkflow === 'SCHEMATIC_CHECK' }"><input type="radio" v-model="uploadWorkflow" value="SCHEMATIC_CHECK" name="upload-workflow"/><span><strong>原理图识别并核对 <small>默认</small></strong><p>独立分析原理图，再读取图内部件表核对型号、数量和位号差异。</p></span></label>
+          <label :class="{ selected: uploadWorkflow === 'TABLE_EXTRACT' }"><input type="radio" v-model="uploadWorkflow" value="TABLE_EXTRACT" name="upload-workflow"/><span><strong>仅提取部件表</strong><p>只整理图内表格，保留原文和数量；不分析整套电路，不自动补充物料。</p><small>导出注明“未经原理图核对”。未检测到表格时会提示，不自动切换模式。</small></span></label>
+        </div></div><div class="modal-footer"><button class="btn btn-light" @click="cancelUpload">取消</button><button class="btn btn-primary" @click="submitUpload" :disabled="loading || !pendingUpload">{{ uploadWorkflow === 'TABLE_EXTRACT' ? '上传并提取部件表' : '上传并分析原理图' }}</button></div>
+      </section>
+    </div>
+    <div class="modal-backdrop" v-if="showTableDialog" @click.self="!loading && (showTableDialog = false)">
+      <section class="modal-box workflow-dialog" role="dialog" aria-modal="true" aria-labelledby="table-workflow-title">
+        <div class="modal-header"><span id="table-workflow-title">仅提取部件表</span><button class="btn btn-outline btn-sm" :disabled="loading" @click="showTableDialog = false" aria-label="关闭表页选择">✕</button></div>
+        <div class="modal-body"><p>将建立独立新项目，保留当前项目的清单和人工审核记录。不启动原理图 AI 分析。</p><div class="table-page-options"><label><input type="radio" v-model="tablePageChoice" value="AUTO" name="table-pages"/> 自动检测所有部件表</label><label><input type="radio" v-model="tablePageChoice" value="SELECT" name="table-pages"/> 仅提取指定图页中的部件表</label></div><div v-if="tablePageChoice === 'SELECT'" class="cad-sheet-grid"><label v-for="p in projectData?.pages || []" :key="p.page_num"><input type="checkbox" v-model="tableSelectedPages" :value="p.page_num" :aria-label="'提取表页 P' + p.page_num"/><span>P{{ p.page_num }} · {{ p.title }}{{ p.page_type === 'PART_LIST' ? '（已检测到表格）' : '' }}</span></label></div><p class="panel-notice">相同物理位置的重复 CAD 图框会排除；不同位置、不同版本的表格保留为独立记录，不自动累计。</p></div><div class="modal-footer"><button class="btn btn-light" :disabled="loading" @click="showTableDialog = false">取消</button><button class="btn btn-primary" :disabled="loading || (tablePageChoice === 'SELECT' && !tableSelectedPages.length)" @click="createTableProject">{{ loading ? '正在提取…' : '建立部件表提取项目' }}</button></div>
+      </section>
+    </div>
     <div class="modal-backdrop" v-if="showAddModal" @click.self="showAddModal = false">
-      <div class="modal-box">
+      <div class="modal-box" style="width:720px;">
         <div class="modal-header">
-          <span>➕ 手动新增 BOM 物料行</span>
+          <span>{{ boxCropBase64 ? '✏️ 图纸框选智能提取与自主标注 (自动沉淀 YOLO 样本)' : '➕ 手动新增 BOM 物料行' }}</span>
           <button class="btn btn-outline btn-sm" @click="showAddModal = false">✕</button>
         </div>
         <div class="modal-body">
+          <!-- Cropped Preview & Auto-Extracted Tokens when opened via PDF Box Drawing -->
+          <div
+            v-if="boxCropBase64 || (boxRecognizedTokens && boxRecognizedTokens.length > 0)"
+            style="display:flex; gap:14px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:8px; padding:12px; margin-bottom:14px; align-items:flex-start;"
+          >
+            <div v-if="boxCropBase64" style="flex-shrink:0; text-align:center;">
+              <div style="font-size:11px; color:#64748b; margin-bottom:4px;">📸 框选区域高清切片 (第{{ addForm.primary_page }}页)</div>
+              <img
+                :src="boxCropBase64"
+                style="max-width:190px; max-height:130px; border:2px solid #10b981; border-radius:6px; background:#fff; object-fit:contain;"
+              />
+            </div>
+            <div style="flex:1; min-width:0;">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                <span style="font-size:12px; font-weight:700; color:#0f172a;">
+                  🔍 框内自动抠取文字 ({{ boxRecognizedTokens.length }}项 · 含矢量与 RapidOCR)：
+                </span>
+                <div class="category-pills">
+                  <button class="cat-pill" :class="{ active: tokenFillTarget === 'model' }" @click="tokenFillTarget = 'model'">点选填【型号】</button>
+                  <button class="cat-pill" :class="{ active: tokenFillTarget === 'tag' }" @click="tokenFillTarget = 'tag'">点选填【位号】</button>
+                  <button class="cat-pill" :class="{ active: tokenFillTarget === 'name' }" @click="tokenFillTarget = 'name'">点选填【名称】</button>
+                </div>
+              </div>
+              <div v-if="boxRecognizedTokens.length > 0" style="display:flex; flex-wrap:wrap; gap:6px;">
+                <span
+                  v-for="(tok, idx) in boxRecognizedTokens"
+                  :key="idx"
+                  class="token-pill"
+                  title="点击直接填入上方选中的字段"
+                  @click="applyRecognizedToken(tok)"
+                >
+                  {{ tok }}
+                </span>
+              </div>
+              <div v-else style="font-size:12px; color:#64748b;">
+                该框内未检出文字（纯图形符号），可直接确认下方元器件类别与型号后加入 BOM 并作为纯图形样本喂给 YOLO 训练集。
+              </div>
+            </div>
+          </div>
+
           <div class="form-grid">
             <div class="form-field">
               <label>设备标识符 / 位号</label>
@@ -452,11 +670,11 @@
             </div>
             <div class="form-field">
               <label>品牌 / 制造商</label>
-              <input v-model="addForm.brand" placeholder="如 施耐德 / Siemens" />
+              <input v-model="addForm.brand" placeholder="如 施耐德 / 西门子 / 国产" />
             </div>
             <div class="form-field">
               <label>名称 / 描述</label>
-              <input v-model="addForm.name" placeholder="如 断路器 / 熔断器" />
+              <input v-model="addForm.name" placeholder="如 断路器 / 交流接触器 / 熔断器" />
             </div>
             <div class="form-field">
               <label>型号 / 订货编号</label>
@@ -474,15 +692,44 @@
               <label>关联图纸页码</label>
               <input type="number" v-model="addForm.primary_page" />
             </div>
+            <div class="form-field" v-if="boxCropBase64">
+              <label>框内符号类型（确认后可作为训练样本）</label>
+              <select v-model="addForm.symbol_class">
+                <option :value="undefined">暂不确认类型</option>
+                <option value="circuit_breaker">断路器</option>
+                <option value="contactor_coil">接触器或继电器线圈</option>
+                <option value="contactor_contact">主触点或辅助触点</option>
+                <option value="thermal_relay">热继电器</option>
+                <option value="motor">电机</option>
+                <option value="fuse">熔断器</option>
+                <option value="transformer">变压器或电源</option>
+                <option value="plc_module">PLC 模块</option>
+                <option value="switch_button">开关、按钮或指示灯</option>
+                <option value="terminal_other">端子或其他元件</option>
+              </select>
+            </div>
             <div class="form-field">
-              <label>备注</label>
+              <label>备注 (自动记录框选坐标)</label>
               <input v-model="addForm.remark" />
             </div>
           </div>
         </div>
-        <div class="modal-footer">
-          <button class="btn btn-light" @click="showAddModal = false">取消</button>
-          <button class="btn btn-primary" @click="submitAddItem">确认添加并同步</button>
+        <div class="modal-footer" style="justify-content:space-between;">
+          <div>
+            <button
+              v-if="selectedItemObj && boxCropBase64"
+              class="btn btn-outline"
+              style="background:#eff6ff; color:#1d4ed8; border-color:#93c5fd;"
+              @click="bindDrawnBoxToSelectedRow"
+              title="不新增行，仅将刚才在图上画的矩形框绑定给右侧当前选中的 BOM 行"
+            >
+              🔗 仅将此坐标框绑定给选中行 [序号{{ selectedItemObj.seq_no }}: {{ selectedItemObj.name }}]
+            </button>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-light" @click="showAddModal = false">取消</button>
+            <button class="btn btn-primary" @click="submitAddItem">➕ 作为新物料加入 BOM</button>
+          </div>
         </div>
       </div>
     </div>
@@ -496,7 +743,7 @@
         </div>
         <div class="modal-body">
           <p style="font-size:12.5px; color:#475569; margin-bottom:10px;">
-            可在此直接配置：非采购件过滤规则（如液压站 <code>DT/SP</code> 占位号）、西门子 PLC 必配附件补全、施耐德 <code>XB2/GV2</code> 系列映射及导线端子估算规则。保存后将自动重新解析当前图纸。
+            可在此直接配置：非采购件过滤规则（如液压站 <code>DT/SP</code> 占位号）、西门子 PLC 必配附件补全、施耐德 <code>XB2/GV2</code> 系列映射及导线端子估算规则。重新解析前会备份当前审核结果。
           </p>
           <textarea class="rules-textarea" v-model="rulesJsonText"></textarea>
         </div>
@@ -511,16 +758,12 @@
     <div class="modal-backdrop" v-if="showVlmModal" @click.self="showVlmModal = false">
       <div class="modal-box" style="width:660px;">
         <div class="modal-header">
-          <span>🤖 Actor-Critic 双大模型 & RapidOCR 双通道配置</span>
+          <span>🤖 PDF 识别与疑点复核配置</span>
           <button class="btn btn-outline btn-sm" @click="showVlmModal = false">✕</button>
         </div>
         <div class="modal-body">
-          <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:10px 12px; margin-bottom:12px; font-size:12.5px; color:#166534;">
-            <strong>✅ 第1层（本地 RapidOCR 离线双通道引擎）：</strong> 已就绪（无需 API Key，自动识别 CAD 曲线化轮廓文字如 <code>REXL2TMP7</code>、<code>LF60G-BPAA850SB</code> 与矢量电柜尺寸）。<br/>
-            <strong>✅ 第2层（免 YOLO 矢量分离 + NetworkX 追线 + 微软 SoM 视觉打标）：</strong> 已就绪（自动在图纸上生成 <code>[#1], [#2]</code> 候选元件框与纵向连通支路）。
-          </div>
           <p style="font-size:12.5px; color:#475569; margin-bottom:12px; line-height:1.5;">
-            配置任意兼容 OpenAI 接口的多模态视觉模型（<strong>Actor</strong>，如 <code>qwen-vl-max</code> / <code>gemini-2.5-pro</code> / <code>claude-3-7-sonnet</code> / <code>gpt-4o</code>）与推理审计模型（<strong>Critic</strong>，如 <code>deepseek-r1</code> / <code>o3-mini</code>），即可开启完整的 <strong>SoM 视觉锚定 + Actor-Critic 反思闭环</strong>。
+            原文与坐标提供文字证据，AI 独立查看整页和高清分块。默认采用 medium 识别，证据冲突时采用 high 复核。结果保留原图位置，型号和采购数量仍需人工审核。
           </p>
           <div class="form-grid" style="grid-template-columns: 1fr 1fr;">
             <div class="form-field" style="grid-column: span 2;">
@@ -529,25 +772,30 @@
             </div>
             <div class="form-field" style="grid-column: span 2;">
               <label>API Base URL (OpenAI 兼容地址)</label>
-              <input v-model="vlmForm.base_url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+              <input v-model="vlmForm.base_url" placeholder="http://localhost:60563/v1" />
             </div>
             <div class="form-field">
-              <label>Actor 视觉识图模型 (VLM Model)</label>
-              <input v-model="vlmForm.model" placeholder="qwen-vl-max / gpt-4o / gemini-2.5-pro" />
+              <label>识别与复核模型</label>
+              <input v-model="vlmForm.model" placeholder="gpt-6.1-sol" />
             </div>
             <div class="form-field">
-              <label>Critic 推理审计模型 (Reasoning LLM)</label>
-              <input v-model="vlmForm.critic_model" placeholder="deepseek-r1 / o3-mini / qwen-max" />
+              <label>API 协议</label>
+              <select v-model="vlmForm.api_protocol"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select>
             </div>
+            <div class="form-field"><label>常规识别思考程度</label><select v-model="vlmForm.reasoning_effort"><option>low</option><option>medium</option><option>high</option></select></div>
+            <div class="form-field"><label>疑点复核思考程度</label><select v-model="vlmForm.review_reasoning_effort"><option>medium</option><option>high</option><option>xhigh</option></select></div>
+            <div class="form-field"><label>每个任务最多复核页数</label><input type="number" min="0" max="12" v-model.number="vlmForm.max_high_review_pages" /></div>
+            <div class="form-field"><label><input type="checkbox" v-model="vlmForm.auto_run_on_upload" /> 上传后自动启动 AI 识别</label></div>
             <div class="form-field" style="grid-column: span 2;">
               <label>API Key (密钥)</label>
-              <input type="password" v-model="vlmForm.api_key" placeholder="sk-..." />
+              <p v-if="vlmForm.credential_rotation_required" style="color:#b91c1c">旧密钥曾写入版本历史，已停用。请在服务商后台撤销旧密钥并填入新密钥。</p>
+              <input type="password" v-model="vlmForm.api_key" :placeholder="vlmForm.has_api_key ? '已配置，留空保留原密钥' : '输入 API Key'" />
             </div>
           </div>
         </div>
         <div class="modal-footer">
           <button class="btn btn-light" @click="showVlmModal = false">取消</button>
-          <button class="btn btn-primary" @click="saveVlmConfig">💾 保存双模型配置</button>
+          <button class="btn btn-primary" @click="saveVlmConfig">保存 AI 配置</button>
         </div>
       </div>
     </div>
@@ -556,12 +804,12 @@
     <div class="modal-backdrop" v-if="showYoloModal" @click.self="showYoloModal = false">
       <div class="modal-box" style="width:700px;">
         <div class="modal-header">
-          <span>🧬 工业电气符号 YOLOv11 自进化训练集 (Human-in-the-Loop Autodistill)</span>
+          <span>符号样本库</span>
           <button class="btn btn-outline btn-sm" @click="showYoloModal = false">✕</button>
         </div>
         <div class="modal-body" v-if="yoloStatus">
           <p style="font-size:12.5px; color:#475569; margin-bottom:12px; line-height:1.5;">
-            <strong>工作原理：</strong>每次工程师在网页端修改、确认或导出 BOM 时，系统自动将已确认的电气元器件包围盒按 <strong>10 类 IEC 国际电气符号标准</strong> 导出为 <code>YOLOv11</code> 格式（无需人工手动画框标注），随时可运行一键微调脚本生成本厂专属 YOLO 权重。
+            <strong>工作原理：</strong>只有工程师确认过的符号框进入训练样本。自动框与待审核结果不直接用于训练，样本归档不会代替物料采购审核。
           </p>
           <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:14px;">
             <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; text-align:center;">
@@ -607,6 +855,6 @@
   </div>
 
   <script src="/assets/vue.global.prod.js"></script>
-  <script src="/assets/app.js"></script>
+  <script src="/assets/app.js?v=20261112-page-order"></script>
 </body>
 </html>

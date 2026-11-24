@@ -16,13 +16,18 @@ This skill orchestrates the decoupled `bom_extractor` Python core engine to extr
 1. **Stage 1: Page Structure & Mode Classification (`classifier.py`)**
    - Normalizes PDF page rotation (`0°/90°/180°/270°` via `page.rotation_matrix`) so coordinates are always in visual top-left `(0, 0)` to bottom-right `(width, height)` space.
    - Classifies every page (`COVER`, `CABINET_LAYOUT`, `INSTALL_LAYOUT`, `MAIN_CIRCUIT`, `CONTROL_CIRCUIT`, `PLC_WIRING`, `INSTRUMENT_WIRING`, `TERMINAL_DIAGRAM`, `PART_LIST`).
-   - Routes the PDF to either:
-     - **`PART_LIST_MODE`** (when EPLAN `部件列表` pages exist, e.g. `双钱L9_20261020.pdf` Pages 21–28): Extracts tabular rows by coordinate grid + cross-verifies against schematic & layout pages (Pages 2–20).
-     - **`SCHEMATIC_MODE`** (pure CAD schematics without embedded part lists, e.g. `C26368.pdf`): Extracts native text/tags/models spatially, crops vector-outline regions (`crops/*.png`) for VLM recognition, deduplicates coils/contacts across pages, and infers symmetric circuit topology (e.g., 45KW Star-Delta motor branches).
+   - By default, NEW projects use **`SCHEMATIC_MODE` with `independent-schematic-v1`**. Detect embedded parts-table pages/regions and mask BOTH pixels and native/OCR evidence into `schematic_only.pdf`. Keep page indexes and exclusion masks for review. Never send the original table to schematic AI.
+   - Extract the schematic BOM first and persist `independent_snapshot.json` BEFORE reading the original parts list. Store the table separately as `declared_parts`; compare full scoped tags, component roles, model/parameters, quantities and units in `reconciliation`. Unknown lengths/quantities stay null.
+   - Historical `PART_LIST_MODE` projects are read-only with respect to machine reanalysis; clone through the independent-analysis endpoint. Preserve existing engineer edits. Human adoption of a table model only changes the working BOM and explicit provenance, never the independent snapshot. AI caches use masked-view hash plus agent version, and missing masks fail closed.
+   - Verify table isolation visually for each unfamiliar layout. Automated detection is not a guarantee of arbitrary table formats. Ground-truth engineer BOMs remain evaluation data, never extraction inputs or catalogue rules.
+
+   - Explicit **`TABLE_EXTRACT`** uses `PART_LIST_MODE` with `parts-table-only-v1` and `summary.table_extraction`. Read literal table rows without schematic analysis, engineering additions, automatic AI or quantity filtering. Preserve blanks, zeroes, grouped tags and raw fields. Different table pages remain separate. Missing tables do not trigger a schematic fallback. Export clearly labels “未经原理图核对”. This explicit mode is distinct from historical table-led projects.
+   - Mode changes create new projects. Preserve all original engineer work. `POST /api/projects/{id}/table-extraction` accepts optional page selection and reuses the original view. Only physically coincident CAD borders with matching native entities may be deduplicated; do not deduplicate separate pages or versions merely because their text matches.
 
 2. **Stage 2: Deterministic Engineering Rules & Anomaly Detection (`rules.py`)**
    - Filters non-procurement field placeholders (`DT1~17`, `SP1~8`, quantity `0` items like `-SPD`) into a recoverable `filtered_items` list.
-   - Appends mandatory PLC/breaker accessories (`+6ES7592-1BM00-0XB0`, `+6ES7590-1AB60-0AA0+6ES7954-8LL04-0AA0`, `+EZDFASB2`, `+GVAE11`) and standard panel series mappings (`XB2` indicator lights/buttons, `RXM2` relays).
+   - Keeps enterprise PLC/breaker accessory and panel-series choices as pending `selection_suggestions`. Never rewrite the drawing model or use the supplied engineer BOM to invent extraction rules. Human acceptance preserves `raw_model` and evidence.
+   - Retains terminal/cable material candidates. Unknown terminal counts, cable lengths, repeated-template quantities and component-only observations are unresolved quantities, never implicit zero or one. Catalogue selection, supply scope and quantity must remain distinct from drawing observations.
    - Flags conflicts & omissions (`MISSING_IN_PART_LIST`, `PARAM_MISMATCH`, `BRAND_TYPO`, `LAYOUT_MISMATCH`) with exact page and normalized `bbox` coordinates.
 
 ## Standard Execution Steps
@@ -37,15 +42,20 @@ python .agents/skills/electrical-bom-extractor/scripts/extract_bom.py --pdf "<pa
 Before finalizing or when debugging a new customer drawing, inspect the generated intermediate files in `output/<project_name>/`:
 - `stage1_page_structure.json`: Page types, text block counts, and vector-text warnings.
 - `stage2_raw_extracted.json`: Raw extracted components prior to rule filtering.
+- `schematic_only.pdf`, `isolation_plan.json`: Masked AI view and excluded/mixed-page masks.
+- `independent_snapshot.json`, `declared_parts.json`: Independently saved facts and literal table reference.
 - `crops/`: High-DPI PNG crops of non-text / CAD vector-outline regions.
 - `<stem>_提取结果.json`: Complete JSON with `itemized_bom`, `aggregated_bom`, `filtered_items`, and `review_items`.
-- `<stem>_标准BOM清单.xlsx`: Multi-sheet styled Excel BOM ready for procurement.
+- `<stem>_标准BOM清单.xlsx`: Compact employee Excel: one materials sheet, plus unresolved issues only when applicable. Full provenance remains in the separate diagnostics export, never claim automatic extraction is approved procurement.
 
 ### 3. Run Accuracy Evaluation (When Ground-Truth BOM is Provided)
 Compare the extraction output against a human standard Excel BOM:
 ```powershell
 python .agents/skills/electrical-bom-extractor/scripts/extract_bom.py --pdf "<path/to/drawing.pdf>" --ground-truth "<path/to/standard_bom.xlsx>"
 ```
+
+
+- Default Excel exports are compact: `物料清单` only in `TABLE_EXTRACT`, and optionally `待确认事项` in schematic-check mode. Use `export_to_excel(..., diagnostic=True)` or `/export/excel/diagnostics` for raw fields, full snapshots, evidence, page diagnostics and task history. Neither export may mutate saved facts or engineer decisions.
 
 ## Domain Rules Reference
 For detailed electrical design rules (handling `KM1` vs `KM1-1`/`KM1-2`, coil/contact deduplication, terminal strips, and explicit vs inferred items), read [electrical_rules.md](./references/electrical_rules.md).

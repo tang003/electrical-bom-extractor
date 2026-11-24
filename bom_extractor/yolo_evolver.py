@@ -1,127 +1,98 @@
 from __future__ import annotations
+import hashlib
 import json
-from datetime import datetime
+import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 import pymupdf
-
 from .models import ExtractionResult, PageType
 from .topology_graph import VectorTopologyBuilder
 
 
 class YOLOSelfEvolver:
-    """
-    Layer 5: Human-in-the-Loop YOLOv11 Auto-Distillation & Self-Evolution Engine
-    Automatically converts engineer-verified BOM items & bounding boxes ( plus
-    vector-clustered symbol boxes ) into a standard Ultralytics YOLOv8/YOLOv11
-    training dataset (`dataset/yolo_electrical/data.yaml`, `images/train`, `labels/train`).
-    """
-
+    """Only explicitly confirmed symbol boxes enter managed training manifests."""
     DATASET_DIR = Path(__file__).resolve().parent.parent / "dataset" / "yolo_electrical"
 
     @classmethod
-    def archive_project_to_yolo_dataset(
-        cls,
-        result: ExtractionResult,
-        pdf_path: Path,
-        dpi: int = 160,
-    ) -> Dict[str, Any]:
-        """
-        Export validated component bounding boxes from `result` and `pdf_path`
-        into YOLOv11 format (`<class_id> <xc> <yc> <w> <h>`).
-        """
-        images_dir = cls.DATASET_DIR / "images" / "train"
-        labels_dir = cls.DATASET_DIR / "labels" / "train"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        labels_dir.mkdir(parents=True, exist_ok=True)
+    def _manifest(cls):
+        path = cls.DATASET_DIR / "verified_manifest.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
-        # Group bounding boxes by 1-based page number
-        boxes_by_page: Dict[int, List[str]] = {}
-        items = result.itemized_bom if result.extraction_mode == "PART_LIST_MODE" else result.aggregated_bom
+    @classmethod
+    def has_archived_project(cls, project_id):
+        return project_id in cls._manifest()
 
-        # Map page types to avoid exporting pure cover/part-list text tables as symbol training pages
-        page_type_map = {p.page_num: p.page_type for p in result.pages}
-
-        total_boxes = 0
-        for item in items:
-            if item.category == "auxiliary":
+    @classmethod
+    def archive_project_to_yolo_dataset(cls, result: ExtractionResult, pdf_path: Path, dpi: int = 160) -> Dict[str, Any]:
+        root = cls.DATASET_DIR.resolve()
+        images, labels = root / "images" / "train", root / "labels" / "train"
+        images.mkdir(parents=True, exist_ok=True)
+        labels.mkdir(parents=True, exist_ok=True)
+        token = re.sub(r"[^\w-]", "_", result.project_id)[:60] + "_" + hashlib.sha256(result.project_id.encode()).hexdigest()[:12]
+        blocked_tags = {tag.strip() for rev in result.review_items if rev.status == "PENDING" for tag in re.split(r"[,，]", rev.tag)}
+        page_types = {p.page_num: p.page_type for p in result.pages}
+        by_page = {}
+        for item in result.itemized_bom:
+            if item.needs_review or item.category == "auxiliary" or item.is_quantity_adjustment or item.quantity is None or item.quantity <= 0:
                 continue
-            cls_id, _ = VectorTopologyBuilder.classify_tag_to_yolo_class(item.tag, item.name)
-
-            # Collect from primary_bbox + all evidence locations
-            ev_list = [(item.primary_page, item.primary_bbox)]
+            if any(tag in blocked_tags for tag in (item.tags or [item.tag])):
+                continue
             for ev in item.evidences:
-                if ev.norm_bbox and len(ev.norm_bbox) == 4:
-                    ev_list.append((ev.page, ev.norm_bbox))
-
-            seen_on_page = set()
-            for pno, nb in ev_list:
-                if not nb or len(nb) != 4:
+                if not ev.verified or ev.symbol_class not in VectorTopologyBuilder.ELECTRICAL_CLASSES:
                     continue
-                ptype = page_type_map.get(pno, "")
-                if ptype in (PageType.COVER.value, PageType.PART_LIST.value):
+                if page_types.get(ev.page) in (PageType.COVER.value, PageType.PART_LIST.value, PageType.TERMINAL_DIAGRAM.value):
                     continue
-                nx0, ny0, nx1, ny1 = [max(0.0, min(1.0, float(v))) for v in nb]
-                bw = nx1 - nx0
-                bh = ny1 - ny0
-                if bw <= 0.005 or bh <= 0.005 or bw > 0.85 or bh > 0.85:
+                nb = ev.norm_bbox
+                if len(nb) != 4 or not all(0 <= v <= 1 for v in nb):
                     continue
-                xc = (nx0 + nx1) / 2.0
-                yc = (ny0 + ny1) / 2.0
-                key = (pno, round(xc, 2), round(yc, 2))
-                if key in seen_on_page:
+                x0,y0,x1,y1 = nb
+                if not (0.005 < x1-x0 < .85 and .005 < y1-y0 < .85):
                     continue
-                seen_on_page.add(key)
-                line = f"{cls_id} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}"
-                boxes_by_page.setdefault(pno, []).append(line)
-                total_boxes += 1
-
-        saved_pages = 0
-        if pdf_path.exists() and boxes_by_page:
-            doc = pymupdf.open(str(pdf_path))
-            try:
-                for pno, lines in boxes_by_page.items():
-                    if 1 <= pno <= len(doc):
-                        stem = f"{result.project_id}_p{pno:03d}"
-                        img_file = images_dir / f"{stem}.png"
-                        lbl_file = labels_dir / f"{stem}.txt"
-                        if not img_file.exists():
-                            pix = doc[pno - 1].get_pixmap(dpi=dpi)
-                            pix.save(str(img_file))
-                        # Deduplicate lines
-                        unique_lines = list(dict.fromkeys(lines))
-                        lbl_file.write_text("\n".join(unique_lines) + "\n", encoding="utf-8")
-                        saved_pages += 1
-            finally:
-                doc.close()
-
+                class_id = VectorTopologyBuilder.ELECTRICAL_CLASSES.index(ev.symbol_class)
+                line = f"{class_id} {(x0+x1)/2:.6f} {(y0+y1)/2:.6f} {x1-x0:.6f} {y1-y0:.6f}"
+                by_page.setdefault(ev.page, set()).add(line)
+        manifest = cls._manifest()
+        previous = manifest.get(result.project_id, [])
+        stems = []
+        if by_page and Path(pdf_path).exists():
+            with pymupdf.open(pdf_path) as doc:
+                for pno, lines in sorted(by_page.items()):
+                    if not 1 <= pno <= len(doc):
+                        continue
+                    stem = f"{token}_p{pno:03d}"
+                    # Always refresh an image with its labels; a replacement PDF must not reuse stale pixels.
+                    doc[pno-1].get_pixmap(dpi=dpi).save(images / f"{stem}.png")
+                    (labels / f"{stem}.txt").write_text("\n".join(sorted(lines))+"\n", encoding="utf-8")
+                    stems.append(stem)
+        # Delete only this manifest's managed, obsolete label files. Legacy data remains untouched.
+        for stem in set(previous)-set(stems):
+            obsolete = (labels / f"{stem}.txt").resolve()
+            if obsolete.parent == labels.resolve():
+                obsolete.unlink(missing_ok=True)
+        manifest[result.project_id] = stems
+        (root / "verified_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         cls._write_data_yaml_and_train_script()
         status = cls.get_dataset_status()
-        status["last_archived_project"] = result.project_id
-        status["last_archived_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        status["newly_archived_pages"] = saved_pages
-        status["newly_archived_boxes"] = total_boxes
-
-        meta_path = cls.DATASET_DIR / "dataset_meta.json"
-        meta_path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+        status.update(last_archived_project=result.project_id, newly_archived_pages=len(stems),
+                      newly_archived_boxes=sum(len(by_page.get(int(stem.rsplit('_p',1)[1]), [])) for stem in stems))
         return status
 
     @classmethod
     def _write_data_yaml_and_train_script(cls) -> None:
         cls.DATASET_DIR.mkdir(parents=True, exist_ok=True)
-        root_posix = cls.DATASET_DIR.as_posix()
-        yaml_lines = [
-            f"path: {root_posix}",
-            "train: images/train",
-            "val: images/train",
-            "",
-            "names:",
-        ]
-        for idx, name in enumerate(VectorTopologyBuilder.ELECTRICAL_CLASSES):
-            yaml_lines.append(f"  {idx}: {name}")
-
-        (cls.DATASET_DIR / "data.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
-
+        projects = sorted(pid for pid, stems in cls._manifest().items() if stems)
+        # Hold out complete projects, never random pages of the same drawing.
+        val_projects = set(projects[-max(1, len(projects)//5):]) if len(projects) > 1 else set()
+        for split in ("train", "val"):
+            files = []
+            for pid in projects:
+                if (pid in val_projects) != (split == "val"):
+                    continue
+                files.extend((cls.DATASET_DIR / "images" / "train" / f"{stem}.png").resolve().as_posix() for stem in cls._manifest()[pid])
+            (cls.DATASET_DIR / f"{split}.txt").write_text("\n".join(files) + ("\n" if files else ""), encoding="utf-8")
+        yaml = [f"path: {json.dumps(cls.DATASET_DIR.resolve().as_posix(), ensure_ascii=False)}", "train: train.txt", "val: val.txt", "", "names:"]
+        yaml.extend(f"  {idx}: {name}" for idx, name in enumerate(VectorTopologyBuilder.ELECTRICAL_CLASSES))
+        (cls.DATASET_DIR / "data.yaml").write_text("\n".join(yaml)+"\n", encoding="utf-8")
         train_script = '''"""
 Auto-generated Ultralytics YOLOv11 Training & ONNX Export Script
 Run:
@@ -140,6 +111,8 @@ def main():
 
     ds_dir = Path(__file__).resolve().parent
     data_yaml = ds_dir / "data.yaml"
+    if not (ds_dir / "train.txt").read_text(encoding="utf-8").strip() or not (ds_dir / "val.txt").read_text(encoding="utf-8").strip():
+        raise ValueError("训练前至少需要两个独立项目的已确认符号样本，分别用于训练和验证")
     model = YOLO("yolo11n.pt")
     model.train(data=str(data_yaml), epochs=50, imgsz=640, batch=8, project=str(ds_dir / "runs"), name="electrical_yolo11")
     onnx_path = model.export(format="onnx", imgsz=640)
@@ -153,35 +126,23 @@ if __name__ == "__main__":
 '''
         (cls.DATASET_DIR / "train_yolo11.py").write_text(train_script, encoding="utf-8")
 
+
     @classmethod
     def get_dataset_status(cls) -> Dict[str, Any]:
-        images_dir = cls.DATASET_DIR / "images" / "train"
-        labels_dir = cls.DATASET_DIR / "labels" / "train"
-        img_files = list(images_dir.glob("*.png")) if images_dir.exists() else []
-        lbl_files = list(labels_dir.glob("*.txt")) if labels_dir.exists() else []
-        total_annotations = 0
-        class_counts: Dict[str, int] = {name: 0 for name in VectorTopologyBuilder.ELECTRICAL_CLASSES}
-
-        for lf in lbl_files:
-            try:
-                for line in lf.read_text(encoding="utf-8").splitlines():
-                    parts = line.strip().split()
-                    if len(parts) == 5:
-                        total_annotations += 1
-                        cid = int(parts[0])
-                        if 0 <= cid < len(VectorTopologyBuilder.ELECTRICAL_CLASSES):
-                            cname = VectorTopologyBuilder.ELECTRICAL_CLASSES[cid]
-                            class_counts[cname] = class_counts.get(cname, 0) + 1
-            except Exception:
-                pass
-
-        return {
-            "dataset_dir": str(cls.DATASET_DIR),
-            "data_yaml_path": str(cls.DATASET_DIR / "data.yaml"),
+        manifest = cls._manifest()
+        counts = {name: 0 for name in VectorTopologyBuilder.ELECTRICAL_CLASSES}
+        stems = {stem for files in manifest.values() for stem in files}
+        for stem in stems:
+            label = cls.DATASET_DIR / "labels" / "train" / f"{stem}.txt"
+            if label.exists():
+                for line in label.read_text(encoding="utf-8").splitlines():
+                    parts = line.split()
+                    if len(parts) == 5 and parts[0].isdigit() and int(parts[0]) < len(counts):
+                        counts[VectorTopologyBuilder.ELECTRICAL_CLASSES[int(parts[0])]] += 1
+        return {"dataset_dir": str(cls.DATASET_DIR), "data_yaml_path": str(cls.DATASET_DIR / "data.yaml"),
             "train_script_path": str(cls.DATASET_DIR / "train_yolo11.py"),
             "yolo_onnx_deployed": VectorTopologyBuilder.YOLO_ONNX_PATH.exists(),
-            "image_count": len(img_files),
-            "label_file_count": len(lbl_files),
-            "total_bounding_boxes": total_annotations,
-            "class_distribution": class_counts,
-        }
+            "image_count": len(stems), "label_file_count": len(stems), "total_bounding_boxes": sum(counts.values()),
+            "class_distribution": counts, "verified_project_count": sum(bool(files) for files in manifest.values()),
+            "training_ready": sum(bool(files) for files in manifest.values()) >= 2,
+            "legacy_labels_excluded": True}

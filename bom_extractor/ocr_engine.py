@@ -174,6 +174,41 @@ class DualChannelOCREngine:
         return cropped
 
     @classmethod
+    def run_rapidocr_on_array(cls, img_array: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Run local RapidOCR (PP-OCRv3) on an in-memory numpy array (BGR/RGB) and return list of text boxes.
+        """
+        engine = cls.get_ocr()
+        if engine is None or img_array is None or img_array.size == 0:
+            return []
+        try:
+            result, _ = engine(img_array, use_det=True, use_cls=False, use_rec=True)
+            if not result:
+                rec_res, _ = engine(img_array, use_det=False, use_cls=False, use_rec=True)
+                if rec_res:
+                    items = []
+                    for row in rec_res:
+                        text, score = str(row[0]).strip(), float(row[1])
+                        if text and score >= 0.35:
+                            items.append({"text": text, "confidence": round(score, 4), "box": [[0, 0], [100, 0], [100, 30], [0, 30]]})
+                    return items
+                return []
+            items = []
+            for row in result:
+                box, text, score = row[0], str(row[1]).strip(), float(row[2])
+                if text:
+                    items.append({
+                        "text": text,
+                        "confidence": round(score, 4),
+                        "box": box,
+                    })
+            return items
+        except Exception:
+            return []
+
+    _run_rapidocr_on_bgr = run_rapidocr_on_array
+
+    @classmethod
     def ocr_image_file(cls, image_path: str | Path) -> List[Dict[str, Any]]:
         """
         Run local RapidOCR (PP-OCRv3) on an image file and return list of recognized text boxes:
@@ -264,9 +299,9 @@ class DualChannelOCREngine:
         if engine is None:
             return merged
 
-        rot_rect = page.rect * page.rotation_matrix
-        w = abs(float(rot_rect.width)) or 1.0
-        h = abs(float(rot_rect.height)) or 1.0
+        # page.rect and get_pixmap already use the visual (rotated) page dimensions.
+        w = float(page.rect.width) or 1.0
+        h = float(page.rect.height) or 1.0
 
         if len(native_spans) < 12:
             pix = page.get_pixmap(dpi=dpi)

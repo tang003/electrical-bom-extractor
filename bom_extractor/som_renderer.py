@@ -23,6 +23,8 @@ class SoMVisualPromptBuilder:
         page: pymupdf.Page,
         out_path: Path,
         dpi: int = 200,
+        reference_rows=None,
+        whole_table: bool = False,
     ) -> Dict[str, Any]:
         """
         1. Extract dual-channel text spans (PyMuPDF + RapidOCR).
@@ -31,7 +33,20 @@ class SoMVisualPromptBuilder:
         """
         native_spans = extract_visual_spans(page)
         spans = DualChannelOCREngine.extract_dual_channel_spans(page, native_spans, dpi=dpi)
-        topo = VectorTopologyBuilder.extract_wires_and_symbols(page, spans)
+        from .table_view import row_regions,table_candidates
+        regions=row_regions(reference_rows or [],page.number+1)
+        if whole_table:
+            topo={'page_num':page.number+1,'page_width':float(page.rect.width),'page_height':float(page.rect.height),
+                  'wire_segment_count':0,'symbol_cluster_count':0,'candidates':[],'excluded_candidates':[],'branches':[],'edges':[]}
+        else:
+            body=[s for s in spans if not any(b[0]<=s['cx']/page.rect.width<=b[2] and b[1]<=s['cy']/page.rect.height<=b[3] for _,b in regions)]
+            topo=VectorTopologyBuilder.extract_wires_and_symbols(page,body)
+        table_rows=table_candidates(page,reference_rows or [],spans)
+        offset=max((c['som_id'] for c in topo['candidates']+topo.get('excluded_candidates',[])),default=0)
+        for index,candidate in enumerate(table_rows,offset+1):
+            candidate.update(som_id=index,som_label=f'#{index}')
+        topo['candidates'].extend(table_rows)
+        topo['reference_row_count']=len(table_rows)
 
         pix = page.get_pixmap(dpi=dpi)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)

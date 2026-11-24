@@ -4,7 +4,32 @@ from typing import List, Tuple, Dict, Any, Optional
 import pymupdf
 
 from .classifier import extract_visual_spans
+from .ocr_engine import DualChannelOCREngine
+from .schematic_extractor import COMPONENT_TAG_RE, MODEL_TOKEN_RE, _is_model_compatible_with_tag, _infer_component_name_and_brand
 from .models import BOMItem, ReviewItem, EvidenceLocation, SourceType, PageInfo, PageType
+
+
+def _short_tag(tag: str) -> str:
+    tag = tag.strip().upper()
+    return tag[tag.index("-"):] if tag.startswith("=") and "-" in tag else tag
+
+
+def _model_key(model: str) -> str:
+    return re.sub(r"[\s,，]", "", model).upper()
+
+
+def _nearby_models(anchor, spans, tag):
+    candidates = []
+    for span in spans:
+        text = span["text"].strip()
+        if MODEL_TOKEN_RE.fullmatch(text) and _is_model_compatible_with_tag(tag, text):
+            distance = ((span["cx"]-anchor["cx"])**2 + (span["cy"]-anchor["cy"])**2)**.5
+            if distance < 65:
+                owners = [s for s in spans if COMPONENT_TAG_RE.fullmatch(s["text"]) and _is_model_compatible_with_tag(s["text"], text)]
+                owner = min(owners, key=lambda s: (s["cx"]-span["cx"])**2+(s["cy"]-span["cy"])**2) if owners else anchor
+                if owner["text"] == anchor["text"]:
+                    candidates.append((distance, text))
+    return list(dict.fromkeys(text for _, text in sorted(candidates)))
 
 
 def _parse_placement_page_and_grid(placement: str, page_width: float, page_height: float) -> Tuple[Optional[int], List[float]]:
@@ -30,6 +55,7 @@ def _parse_placement_page_and_grid(placement: str, page_width: float, page_heigh
 def extract_from_part_list_pdf(
     doc: pymupdf.Document,
     pages_info: List[PageInfo],
+    *, table_only: bool = False,
 ) -> Tuple[List[BOMItem], List[ReviewItem]]:
     """
     Extract itemized BOM rows from embedded EPLAN Part List pages (e.g., Pages 21-28)
@@ -43,14 +69,16 @@ def extract_from_part_list_pdf(
     schematic_page_texts: Dict[int, List[Dict[str, Any]]] = {}
 
     for pinfo in pages_info:
+        if table_only:
+            break
         if pinfo.page_type == PageType.PART_LIST.value:
             continue
         page = doc[pinfo.page_num - 1]
-        spans = extract_visual_spans(page)
+        spans = DualChannelOCREngine.extract_dual_channel_spans(page, extract_visual_spans(page))
         schematic_page_texts[pinfo.page_num] = spans
         for s in spans:
             txt = s["text"]
-            if txt.startswith("-") and len(txt) >= 2 and not txt.startswith("-X"):
+            if COMPONENT_TAG_RE.fullmatch(txt) and not txt.startswith(("-X", "=+-X")):
                 clean_tag = txt.split()[0]
                 schematic_tag_locations.setdefault(clean_tag, []).append({
                     "page": pinfo.page_num,
@@ -67,30 +95,30 @@ def extract_from_part_list_pdf(
         page = doc[pinfo.page_num - 1]
         w = float(page.rect.width)
         h = float(page.rect.height)
-        spans = extract_visual_spans(page)
+        spans = DualChannelOCREngine.extract_dual_channel_spans(page, extract_visual_spans(page))
 
         # Filter spans inside the table body region (y in 140..755, x < 1100 to exclude stamp date)
         body_spans = [
             s for s in spans
-            if 140.0 <= s["bbox"][1] <= 755.0 and s["bbox"][0] < 1100.0
+            if 140.0 / 841.89 <= s["bbox"][1] / h <= 755.0 / 841.89 and s["bbox"][0] / w < 1100.0 / 1190.55
         ]
 
         # Find row anchors: 设备标识符 in column 1 (x0 < 100, text starts with '=' and has no '/')
         anchors = sorted(
             [
                 s for s in body_spans
-                if s["bbox"][0] < 100.0 and s["text"].startswith("=") and "/" not in s["text"]
+                if s["bbox"][0] / w < 100.0 / 1190.55 and (s["text"].startswith("=") or COMPONENT_TAG_RE.fullmatch(s["text"])) and "/" not in s["text"]
             ],
             key=lambda s: s["bbox"][1],
         )
 
         for idx, anchor in enumerate(anchors):
             seq_counter += 1
-            y_top = anchor["bbox"][1] - 4.0
+            y_top = anchor["bbox"][1] - 4.0 * h / 841.89
             if idx + 1 < len(anchors):
-                y_bottom = anchors[idx + 1]["bbox"][1] - 4.0
+                y_bottom = anchors[idx + 1]["bbox"][1] - 4.0 * h / 841.89
             else:
-                y_bottom = y_top + 34.0
+                y_bottom = y_top + 34.0 * h / 841.89
 
             row_spans = [
                 s for s in body_spans
@@ -99,14 +127,14 @@ def extract_from_part_list_pdf(
 
             device_tag = anchor["text"].strip()
             placement = ""
-            qty_str = "0"
+            qty_str = ""
             name_parts: List[str] = []
             model_parts: List[str] = []
             brand_parts: List[str] = []
             remark_parts: List[str] = []
 
             for s in sorted(row_spans, key=lambda x: (x["bbox"][1], x["bbox"][0])):
-                x0 = s["bbox"][0]
+                x0 = s["bbox"][0] * 1190.55 / w
                 txt = s["text"].strip()
                 if x0 < 200.0:
                     if txt != device_tag and "/" in txt:
@@ -125,7 +153,7 @@ def extract_from_part_list_pdf(
             try:
                 quantity = float(qty_str) if "." in qty_str else int(qty_str)
             except ValueError:
-                quantity = 1
+                quantity = None
 
             name_val = " ".join(name_parts).strip()
             model_val = " ".join(model_parts).strip()
@@ -145,13 +173,13 @@ def extract_from_part_list_pdf(
                     page=pinfo.page_num,
                     bbox=row_bbox,
                     norm_bbox=row_norm_bbox,
-                    raw_text=f"{device_tag} | {name_val} | {model_val} | {brand_val}",
+                    raw_text=f"{device_tag} | {name_val} | {model_val} | {brand_val} | {qty_str}",
                     role="table_row",
                 )
             ]
 
             # Link schematic location from placement (e.g., =02/13.2:D -> Page 13)
-            short_tag = "-" + device_tag.split("-")[-1] if "-" in device_tag else device_tag
+            short_tag = _short_tag(device_tag)
             schem_page, schem_grid_bbox = _parse_placement_page_and_grid(placement, w, h)
             if short_tag in schematic_tag_locations:
                 for loc in schematic_tag_locations[short_tag]:
@@ -164,7 +192,7 @@ def extract_from_part_list_pdf(
                             role="schematic_symbol",
                         )
                     )
-            elif schem_page:
+            elif schem_page and not table_only:
                 evidences.append(
                     EvidenceLocation(
                         page=schem_page,
@@ -186,136 +214,81 @@ def extract_from_part_list_pdf(
                     seq_no=seq_counter,
                     tag=device_tag,
                     tags=[device_tag],
-                    placement="",  # Matches reference Excel where 放置位置 is left blank by default
+                    placement=placement,
                     name=name_val,
                     model=model_val,
                     raw_model=model_val,
                     brand=brand_val,
-                    unit="个",
+                    unit='',
                     quantity=quantity,
                     remark=remark_val,
-                    pdf_page_label=f"第{pl_idx}页",
+                    pdf_page_label=f"第{pinfo.page_num}页",
                     primary_page=pinfo.page_num,
                     primary_bbox=row_norm_bbox,
                     evidences=evidences,
                     source_type=SourceType.EXPLICIT.value,
                     category="primary",
+                    needs_review=table_only,
+                    quantity_status='unknown' if quantity is None else 'needs_confirmation' if table_only else 'by_tag',
+                    quantity_basis='unknown' if quantity is None else 'explicit_total' if table_only else 'unique_tag',
+                    observations=[{'source':'drawing_parts_list','cells':{'tag':device_tag,'name':name_val,'model':model_val,
+                        'quantity':qty_str,'brand':brand_val,'unit':'','remark':remark_val,'placement':placement}}] if table_only else [],
                 )
             )
 
-    # 3. Cross-verification between Schematic/Layout pages (Pages 2-20) and Part List (Pages 21-28)
-    part_list_short_tags = set()
+    if table_only:
+        return raw_items, []
+
+    # Compare every observed device against every listed device, independent of tag/page numbers.
+    listed = {}
     for item in raw_items:
-        if "-" in item.tag:
-            part_list_short_tags.add("-" + item.tag.split("-")[-1])
-
-    # Check 3.1: Schematic fuse -FU2 on Page 5 & Page 3 missing from Part List
-    if "-FU2" in schematic_tag_locations and "-FU2" not in part_list_short_tags:
-        fu2_locs = schematic_tag_locations["-FU2"]
-        main_loc = next((l for l in fu2_locs if l["page"] == 5), fu2_locs[0])
-        review_items.append(
-            ReviewItem(
-                id="rev_missing_fu2",
-                severity="WARNING",
-                issue_type="MISSING_IN_PART_LIST",
-                tag="=02-FU2",
-                title="疑似漏项：原理图与布置图存在熔断器 [-FU2]，但《部件列表》未列出",
-                description=(
-                    f"在第 {main_loc['page']} 页动力线原理图（控制变压器 -T1 次级 220V 回路）及第 3 页安装板布置图顶排"
-                    "均绘制了熔断器 `-FU2`，但第 23 页《部件列表》仅列出了 `=02-FU1`，漏掉了 `=02-FU2`。"
-                ),
-                suggestion="建议核实控制变压器次级熔断器型号（如施耐德或正泰 1P 熔断器），点击【采纳并加入 BOM】可自动补充。",
-                page=main_loc["page"],
-                norm_bbox=[
-                    max(0.0, main_loc["norm_bbox"][0] - 0.02),
-                    max(0.0, main_loc["norm_bbox"][1] - 0.02),
-                    min(1.0, main_loc["norm_bbox"][2] + 0.03),
-                    min(1.0, main_loc["norm_bbox"][3] + 0.03),
-                ],
-                status="PENDING",
-                action_type="ADD_ITEM",
-                proposed_data={
-                    "tag": "=02-FU2",
-                    "name": "控制回路熔断器",
-                    "model": "RT18-32X 1P 6A",
-                    "brand": "施耐德/正泰",
-                    "quantity": 1,
-                    "unit": "个",
-                    "remark": "原理图第5页检出补漏",
-                    "pdf_page_label": "原理图第5页",
-                },
-            )
-        )
-
-    # Check 3.2: Breaker -F8 parameter conflict (Page 8 RCD 30mA vs Page 23 standard breaker)
-    p8_spans = schematic_page_texts.get(8, [])
-    p8_text = " ".join(s["text"] for s in p8_spans)
-    f8_item = next((it for it in raw_items if it.tag.endswith("-F8") and "辅助" not in it.name), None)
-    if "漏电流30mA" in p8_text and f8_item and "漏" not in f8_item.model and "Vigi" not in f8_item.model:
-        f8_schem_loc = next((s for s in p8_spans if "漏电流30mA" in s["text"] or s["text"] == "-F8"), None)
-        schem_bbox = f8_schem_loc["norm_bbox"] if f8_schem_loc else [0.15, 0.50, 0.25, 0.58]
-        review_items.append(
-            ReviewItem(
-                id="rev_conflict_f8",
-                severity="CONFLICT",
-                issue_type="PARAM_MISMATCH",
-                tag="=02-F8",
-                title="型号参数冲突：[-F8] 原理图要求“1P+N 6A 漏电流30mA”，部件列表为普通空开",
-                description=(
-                    f"第 8 页直流电源原理图插座回路明确标注 `-F8` 为 `1P+N 6A 漏电流30mA`（且第 3 页布置图标注为西门子 `5SU1356` 漏电断路器），"
-                    f"但第 {f8_item.primary_page} 页《部件列表》（序号 {f8_item.seq_no}）中型号为 `{f8_item.model}`（普通微型断路器，无 30mA 漏电保护）。"
-                ),
-                suggestion="插座回路按电气安全规范需带 30mA 漏电保护，建议核实是否将型号修正为带漏电保护型号（如 iDPNa Vigi 1P+N C6A 30mA 或 5SU1356）。",
-                page=8,
-                norm_bbox=[
-                    max(0.0, schem_bbox[0] - 0.03),
-                    max(0.0, schem_bbox[1] - 0.03),
-                    min(1.0, schem_bbox[2] + 0.04),
-                    min(1.0, schem_bbox[3] + 0.04),
-                ],
-                related_page=f8_item.primary_page,
-                related_norm_bbox=f8_item.primary_bbox,
-                status="PENDING",
-                action_type="UPDATE_ITEM",
-                proposed_data={
-                    "target_seq_no": f8_item.seq_no,
-                    "model": "ic65N,C型,2P,6A (需核实30mA漏电附件)",
-                },
-            )
-        )
-
-    # Check 3.3: Layout Page 3 CPU 1512C vs Part List CPU 1511 mismatch
-    p3_spans = schematic_page_texts.get(3, [])
-    p3_text = " ".join(s["text"] for s in p3_spans)
-    cpu_item = next((it for it in raw_items if "CPU" in it.tag or "CPU" in it.name), None)
-    if "1512C" in p3_text and cpu_item and "511-" in cpu_item.model:
-        cpu_loc = next((s for s in p3_spans if "1512C" in s["text"] or "6ES7512" in s["text"]), None)
-        loc_bbox = cpu_loc["norm_bbox"] if cpu_loc else [0.35, 0.45, 0.45, 0.55]
-        review_items.append(
-            ReviewItem(
-                id="rev_conflict_cpu",
-                severity="WARNING",
-                issue_type="LAYOUT_MISMATCH",
-                tag=cpu_item.tag,
-                title="图文不一致：第 3 页布置图 PLC 宏为 [CPU 1512C-1 PN]，部件列表为 [CPU 1511]",
-                description=(
-                    f"第 3 页安装板布置图上 PLC 图形宏标注为 `CPU 1512C-1 PN (6ES7512-1CK01-0AB0)`，"
-                    f"而第 11 页原理图及第 {cpu_item.primary_page} 页《部件列表》（序号 {cpu_item.seq_no}）标注为 `{cpu_item.model}`。"
-                ),
-                suggestion="已按原理图与《部件列表》采用 CPU 1511 (6ES7 511-1AL03-0AB0)，请确认第 3 页是否为旧图框宏未更新。",
-                page=3,
-                norm_bbox=[
-                    max(0.0, loc_bbox[0] - 0.02),
-                    max(0.0, loc_bbox[1] - 0.02),
-                    min(1.0, loc_bbox[2] + 0.04),
-                    min(1.0, loc_bbox[3] + 0.04),
-                ],
-                related_page=cpu_item.primary_page,
-                related_norm_bbox=cpu_item.primary_bbox,
-                status="PENDING",
-                action_type="CONFIRM",
-            )
-        )
+        listed.setdefault(_short_tag(item.tag), []).append(item)
+    for observed_tag, locations in schematic_tag_locations.items():
+        short_tag = _short_tag(observed_tag)
+        entries = listed.get(short_tag, [])
+        location = locations[0]
+        page_no = location["page"]
+        if not entries:
+            near = schematic_page_texts.get(page_no, [])
+            tag_span = next((sp for sp in near if sp["text"] == observed_tag), None)
+            models = _nearby_models(tag_span, near, short_tag) if tag_span else []
+            model = models[0] if len(models) == 1 else "图纸未注(待定)"
+            name, brand = _infer_component_name_and_brand(short_tag, model, [])
+            review_items.append(ReviewItem(id=f"rev_missing_{observed_tag}", severity="WARNING",
+                issue_type="MISSING_IN_PART_LIST", tag=observed_tag,
+                title=f"疑似漏项：原理图位号 {observed_tag} 未列入部件列表",
+                description=f"在第 {page_no} 页检出位号，未找到对应的部件列表记录。",
+                suggestion="核实是否属于采购范围，并确认型号后补入 BOM。", page=page_no,
+                norm_bbox=location["norm_bbox"], action_type="ADD_ITEM",
+                proposed_data={"tag": observed_tag, "name": name, "model": model,
+                               "brand": brand or "待定", "quantity": 1, "unit": "个"}))
+            continue
+        seen_conflicts = set()
+        for loc in locations:
+            near = schematic_page_texts.get(loc["page"], [])
+            tag_span = next((sp for sp in near if sp["text"] == observed_tag), None)
+            models = _nearby_models(tag_span, near, short_tag) if tag_span else []
+            for model in models:
+                model_key = _model_key(model)
+                if any(model_key in _model_key(item.model) for item in entries):
+                    continue
+                if model_key in seen_conflicts:
+                    continue
+                seen_conflicts.add(model_key)
+                target = entries[0]
+                review_items.append(ReviewItem(id=f"rev_model_{observed_tag}_{len(seen_conflicts)}",
+                    severity="CONFLICT", issue_type="PARAM_MISMATCH", tag=observed_tag,
+                    title=f"图文型号待核实：{observed_tag}",
+                    description=f"第 {loc['page']} 页附近型号 {model} 与部件列表 {' / '.join(it.model for it in entries)} 不一致。",
+                    suggestion="核实是否为主件、附件或旧图标注，再确认最终型号。", page=loc["page"],
+                    norm_bbox=loc["norm_bbox"], related_page=target.primary_page, related_norm_bbox=target.primary_bbox))
+            if tag_span:
+                local_text = " ".join(sp["text"] for sp in near if abs(sp["cx"]-tag_span["cx"]) < 90 and abs(sp["cy"]-tag_span["cy"]) < 90)
+                if re.search(r"(?:漏电|剩余电流|RCD).*?30\s*mA", local_text, re.I) and not any(re.search(r"VIGI|5SU|A9D|RCBO|漏电", it.model, re.I) for it in entries):
+                    review_items.append(ReviewItem(id=f"rev_rcd_{observed_tag}_{loc['page']}", severity="CONFLICT",
+                        issue_type="PARAM_MISMATCH", tag=observed_tag, title=f"漏电保护要求待核实：{observed_tag}",
+                        description="原理图局部标注 30mA 漏电保护要求，部件表型号未明确体现该功能。",
+                        suggestion="请确认本体及漏电保护附件选型，不自动替换为猜测型号。", page=loc["page"], norm_bbox=loc["norm_bbox"]))
 
     # Check 3.4: Same model number with inconsistent manufacturer/brand (e.g., RXZE2M114 施耐德 vs 菲尼克斯)
     model_brand_counts: Dict[str, Dict[str, int]] = {}

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -14,19 +15,21 @@ from bom_extractor.evaluator import evaluate_extraction
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     ref_dir = ROOT_DIR / "参考文件"
-    out_root = ROOT_DIR / "output"
+    parser = argparse.ArgumentParser(description="对照两份工程师 BOM 评测原理图提取结果")
+    parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "output")
+    out_root = parser.parse_args().output_dir
 
     benchmarks = [
         {
             "name": "测试集 1：C26368（纯原理图模式，无自带部件列表，含星三角对称推导与CAD曲线文字）",
-            "pdf": ref_dir / "C26368.pdf",
-            "gt_excel": ref_dir / "C26368 bom20261102.xlsx",
+            "pdf": ref_dir / "3-C26368.pdf",
+            "gt_excel": ref_dir / "3-C26368 bom20261102.xlsx",
             "proj_id": "C26368",
         },
         {
-            "name": "测试集 2：双钱L9_20261020（EPLAN自带部件列表模式 + 原理图交叉校验 + 工程清洗）",
-            "pdf": ref_dir / "双钱L9_20261020.pdf",
-            "gt_excel": ref_dir / "双钱L9_部件清单_20261020.xlsx",
+            "name": "测试集 2：双钱L9_20261020（原理图独立识别，隔离图内部件表后核对）",
+            "pdf": ref_dir / "4-双钱L9_20261020.pdf",
+            "gt_excel": ref_dir / "4-双钱L9_部件清单_20261020.xlsx",
             "proj_id": "ShuangQian_L9",
         },
     ]

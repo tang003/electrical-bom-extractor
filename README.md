@@ -1,54 +1,153 @@
-# 工业电控柜电气原理图 BOM 智能提取与图文核对系统 (`electrical-bom-extractor` v2.0)
+# 电气原理图 BOM 提取与审核工作台
 
-一套面向工业电控柜 PDF 电气原理图（同时支持 **纯 CAD 原理图**、**含部件列表的 EPLAN 标准图纸** 与 **扫描/转曲 PDF**）的高精度 BOM 自动提取、跨页去重、工程规则清洗与“左图右表”在线图文核对系统。
+支持原生文本、局部转曲文字以及扫描 PDF 的文字识别，提供部件列表提取、按位号归并、采购汇总、图文定位、人工审核和 Excel/JSON 导出。识别结果需要工程师核实；未识别型号和证据不足的元件会保留为待定或待审核，不填入猜测的采购型号。
 
----
+## 安装与启动
 
-## 一、 v2.0 五层终极架构 (`bom_extractor/`)
+建议在独立 Python 环境中安装：
 
-1. **第 1 层：双通道文字与转曲字还原底座 (`bom_extractor/classifier.py` + `bom_extractor/ocr_engine.py`)**
-   - **`PyMuPDF` 矢量解析**：提取原生矢量文字、精确坐标与 `270°/90°` 旋转矩阵归一化（0 字符误差）。
-   - **`RapidOCR` (PaddleOCR PP-OCRv3 ONNX 离线引擎)**：无需联网和外部 API Key，直接在本地 CPU/GPU 上识别 CAD 导出时炸成几何轮廓曲线的文字（如第 5 页 `REXL2TMP7+RXZE2M114`、第 9 页 `LF60G-BPAA850SB`、第 20 页纯矢量柜体尺寸 `1550*900*300mm`）。
-
-2. **第 2 层：三合一候选元件定位 + 几何矢量追线 (`bom_extractor/topology_graph.py`)**
-   - 借鉴开源项目 `D4NGYY/schematic-extractor`：自动分离 PDF 底层的长导线（Routing Wires）与短笔画元件符号簇（Symbol Clusters），结合位号文本锚点（`-QF1`, `-KM1` 等）与可插拔 `YOLOv11` ONNX 检测器，确保接近 100% 的元件召回率。
-   - 使用 **`NetworkX`** 构建纵向电气支路连通图（自动串联同一竖向支路上的断路器 $\rightarrow$ 接触器 $\rightarrow$ 热继 $\rightarrow$ 电机负载）。
-
-3. **第 3 层：微软 `Set-of-Mark (SoM)` 视觉打标 + Actor 视觉大模型 (`bom_extractor/som_renderer.py` + `bom_extractor/vision.py`)**
-   - 借鉴微软开源 `microsoft/SoM`：在高清图纸上自动用红框圈出所有候选元件并打上醒目的 `[#1]`, `[#2]`, `[#3]` 编号标签，连同框内精确的双通道 OCR 文字锚点与 `NetworkX` 纵向支路链一起喂给 Actor 视觉大模型（支持 `Gemini 2.5 Pro` / `Claude 3.7 Sonnet` / `GPT-4o` / `Qwen-VL-Max`）。
-
-4. **第 4 层：Critic 推理审计大模型 + 品牌基因库与成套规则引擎 (`bom_extractor/rules.py` + `bom_extractor/rules_config.json`)**
-   - 借鉴 `CoRe-VLM` Actor-Critic 架构：对单页提取结果进行复核，跨页合并同一位号的线圈、主触点与辅助触点，顺着纵向支路推导漏标型号。
-   - 内置**工业电气型号前缀基因库**（如 `NSX/GV2/LC1D/LRD/RXM/REXL/XB2` $\rightarrow$ 施耐德，`6ES7/3RT` $\rightarrow$ 西门子，`NDR/EDR` $\rightarrow$ 明纬，`UK` $\rightarrow$ 菲尼克斯），自动反推品牌并纠错（如自动抓出 `双钱L9` 中 `RXZE2M114` 品牌误填为菲尼克斯的笔误）。
-   - 自动过滤数量为 `0` 的占位件及非电控采购的液压电磁铁（`DT1~17`, `SP1~8`），并按企业规则自动补齐西门子 `S7-1500` 前连接器/导轨/存储卡及施耐德 `GVAE11` 辅助触点。
-
-5. **第 5 层：工程师“左图右表” Web 工作台 + YOLOv11 自进化飞轮 (`backend/app.py` + `frontend/` + `bom_extractor/yolo_evolver.py`)**
-   - **左图右表高亮核对**：点击右侧任意物料或待审异常，左侧自动翻页并红框高亮定位；支持一键开启 **【🎯 SoM 候选框/追线层】** 直接查看图纸上的 `[#1]`, `[#2]` 视觉打标框与底部 `NetworkX` 纵向支路连通链。
-   - **YOLOv11 自动蒸馏训练集沉淀 (`dataset/yolo_electrical/`)**：工程师每次在网页上确认或导出 BOM，系统自动将验证后的元件坐标按 10 类 IEC 电气符号标准导出为 `YOLOv11` 训练集（`data.yaml` + `images/train` + `labels/train` + 一键训练脚本 `train_yolo11.py`），全程无需人工画框标注。
-
----
-
-## 二、 快速启动方法
-
-### 方式 1：启动 Web 图文审核工作台（交付给电气工程师日常使用）
-直接双击运行根目录下的 **`start_workbench.bat`**，或在终端执行：
 ```powershell
-python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000
+python -m pip install -r requirements.txt
+python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
-浏览器打开 **http://127.0.0.1:8000** 即可使用。
 
-### 方式 2：使用 Skill / CLI 命令行提取与基准评测
+也可双击 `start_workbench.bat`，访问 http://127.0.0.1:8000 。默认仅接受本机同源访问，不直接对局域网开放。
+
+## CAD 图纸导入（DWG / DXF）
+
+网页上传支持 PDF、DXF 和 DWG，单文件上限 100 MB。DXF 使用 `ezdxf`；DWG 使用独立的 .NET 8 / ACadSharp 读取进程，运行时不启动 AutoCAD，不连接开发者电脑。原始文件保存在项目目录 `source.dwg` / `source.dxf`；`source.pdf` 是分页审核视图。文字与块属性取自 CAD 原生实体，保留句柄、块路径、图层和页面坐标，不依赖 OCR 读取预览图片。
+
+部署前安装 Python 依赖，以及服务器自身的 .NET 8 SDK 或 runtime。构建 DWG 读取器：
+
 ```powershell
-# 提取单份 PDF 图纸并生成 Excel + JSON + 局部切片 + YOLO 标注样本
-python skills/electrical-bom-extractor/scripts/extract_bom.py --pdf "参考文件/C26368.pdf"
+python -m pip install -r requirements.txt
+dotnet publish tools/cad_converter -c Release -o tools/cad_converter/publish --self-contained false
+```
 
-# 运行全量基准评测与单元测试
+当前 Windows 工作站只装 runtime 时，可执行 `python scripts/build_cad_converter.py --bootstrap`；该命令从 NuGet 获取固定版本的 ACadSharp 和微软编译器后构建。上传请求不会自动下载或安装软件。服务器可使用 SDK 构建后复制 `publish/` 全目录，并安装 .NET 8 runtime；Windows 与 Linux 使用相同接口。Linux 部署尚需在目标环境验证，不把本机通过视作服务器验收。
+
+`GET /api/drawing-formats` 返回实际可用格式。可用 `CAD_CONVERTER_DLL` 指定已构建的 DLL，用 `CAD_CONVERT_TIMEOUT` 配置 DWG 转换超时（默认 90 秒）。替换 CAD 引擎时，`CAD_DWG_COMMAND_JSON` 为可信服务器配置的命令参数 JSON 数组，必须包含 `{input}`、`{output}`，可包含 `{report}`；不经 shell 执行。解析器缺失返回明确的 503，内容或转换失败保留原件与日志，不注册成功项目，也不在重启时偷偷重跑失败导入。
+
+有图框的模型空间按图框分页；支持普通二维布局及正投影视口。CAD“元件清单”按表头与行坐标读取，支持拆成单字的表头、组合型号、数量列及原图引用。核对模式下清单只作对照来源；仅提取部件表模式则直接保留表内行，明确注明未经原理图核对。未完成通用 CAD 电气符号、动态块、自定义对象、三维模型、外部参照、内嵌图片及复杂视口的完整解析；导入报告会显示兼容性与字体替代提醒，工程师须对照原件验收。
+
+同名图框逐框保留，原表保留每张图框印刷的数量，不自动作为采购数量，也不把不同版本相加。CAD 导入提示中可选择有效图框，调用 `POST /api/projects/{id}/cad-selection` 建立独立新项目，原项目人工审核结果保留。数量来自清单数量列，不按 `NFB4~7` 之类的代号范围自行推算。图框外文字保存在 `cad/import_report.json`，不会悄悄当成已提取完成。存在同名图框或图框外文字时暂停上传后自动 AI，先核对再显式启动分析。
+
+`GET /api/projects/{id}/source` 下载原始 CAD，`GET /api/projects/{id}/cad-report` 下载分页、兼容性和图框外文字报告。`agent/context` 中包含源格式及 CAD 导入信息，BOM 证据中追加 `cad_refs`，用于追溯原生实体。
+
+实现参考：[ACadSharp](https://github.com/DomCR/ACadSharp)、[ezdxf 绘图与导出](https://ezdxf.readthedocs.io/en/stable/addons/drawing.html)。CAD 与 PDF 一样生成待审核初稿，格式支持不等于 BOM 准确率验收。
+
+## 人工审核结果保存与恢复
+
+- 人工修改、新增、删除、框选证据和审核状态保存在项目目录的 `project_state.json`，通过原子替换写入。
+- 重启优先加载已保存状态，不重新识别已有审核结果。无法读取的状态会保留原文件并报告恢复错误，不用新识别结果覆盖。
+- 按位号明细为基础数据。修改采购汇总数量时，将差额记录为明确的“人工采购数量调整”行，保留原位号的物理数量，避免把整数器件分摊成小数。
+- 导出读取当前保存结果，不重新汇总、不重新识别、不自动增加物料。
+- 同一项目主动重新提取前，在 `history/` 保存当前审核快照；保留该项目人工修改、已确认物料、采购数量调整及删除决定。另行上传的新项目不继承旧项目的人工记录。
+- 项目目录中的 Excel 被占用时，人工修改仍会保存。工作台按下载时的审核结果生成独立文件。
+- 同名 PDF 每次上传创建独立项目，不覆盖已有项目。
+
+## Excel 日常导出与完整诊断资料
+
+默认“导出 BOM”提供员工用的简洁版：仅提部件表时只有“物料清单”；原理图核对模式有未解决的问题时，再增加“待确认事项”。主表固定为序号、名称、型号/规格、品牌、数量、单位、位号、来源图页、确认状态、备注10列。原始字段、坐标、任务信息、过滤备查等不再各占一个日常分表。
+
+导出保留当前工作清单的数据，数量为数字、未知为空、0保留；位号和型号按文字保存。仅提表模式在页头注明未经原理图核对，并按缺型号、缺数量或缺单位显示具体待办，不把全部表行统一标为待审核。已有人工采用的表内型号在备注注明来源。主表提供冻结表头和名称列、筛选、长文本换行、浅色隔行及横向打印；打印时重复表头。
+
+“更多 → 导出完整诊断资料”调用 `GET /api/projects/{id}/export/excel/diagnostics`，保留原有原始字段、独立快照、比较记录、图页结构与训练/任务信息。默认接口仍是 `GET /api/projects/{id}/export/excel`；程序可用 `export_to_excel(result,path,diagnostic=True)` 显式导出详细版。两种导出都不会重新识别或改写已保存的人工审核状态。
+
+## 模型配置与密钥
+
+通过网页配置 OpenAI 兼容的视觉模型接口；留空密钥输入框会保留已有密钥。
+
+密钥保存在当前用户的配置目录，Windows 下使用 DPAPI 加密，不写入项目文件，也不由配置接口返回。可用 `VLM_API_KEY` 环境变量提供凭据。
+
+**旧版本曾将密钥写入 Git 历史。迁移只会清除当前文件并停用旧密钥，无法撤销服务商已签发的凭据；必须在服务商后台撤销旧密钥并配置新密钥。不要仅删除 Git 中的字符串后继续使用原密钥。**
+
+本地 OCR 无需模型 API。网页支持 Responses 和 Chat Completions 两种协议；思考程度显式传递。当前建议 `gpt-6.1-sol`、常规 `medium`、疑点复核 `high`。不支持相应协议或结构化输出的中转服务会显示页面错误，不以离线规则结果冒充 AI 成功。
+
+## 两种处理方式
+
+上传 PDF/DWG/DXF 后，在开始解析前选择处理方式，默认“原理图识别并核对”。这样快捷提表不会先执行一次完整电路分析。
+
+- **仅提取部件表**（`TABLE_EXTRACT`）：读取表格原文和数量，原表行独立保留。不分析原理图、不运行工程补全、不自动增加辅材、不启动原理图 AI。缺失数量为空，0 数量保留，位号范围不倍增数量，不同图页不自动汇总。未找到或未读完整时明确提示，不回退成另一模式。导出名及页头注明“未经原理图核对”；原始字段和提取范围在完整诊断导出中提供。
+- **原理图识别并核对**（`SCHEMATIC_CHECK`）：沿用屏蔽表区后的原理图独立识别，再将表格作为核对来源；已有人工采纳不回流到独立识别。
+
+`POST /api/projects/upload` 通过 multipart 字段 `workflow_mode` 选择模式，缺省为 `SCHEMATIC_CHECK`。已有项目可在“更多 → 仅提取部件表”中选自动检测或指定表页：`POST /api/projects/{id}/table-extraction`，JSON `{"pages":null}` 为自动检测，`{"pages":[4]}` 为只读取第4页中的部件表。每次另建项目，保留源项目及人工记录，复用已有审核视图，不重新转换 DWG。表格项目可另建原理图核对项目。
+
+表格状态和页码保存在 `summary.table_extraction`，原文在 `declared_parts`，人工工作清单在 `itemized_bom`。仅提表模式没有 `independent_bom` 或原理图核对结论，也不将表格行数当成识别准确率。同一物理 CAD 图框的内外边框可排重；不同位置或版本保持独立。支持“记号／品名／型式仕样”及无序号列表头，优先利用真实表格边界定位字段。扫描表格使用本地 OCR；识别失败的页保留待处理，不能声称任意版式都能完整提取。
+
+## AI 后台识别流程
+
+1. 上传后先识别并隔离物料表的整页或混合页区域，同时屏蔽图像与原生/OCR文字。使用隔离视图提取原理图初稿，先保存独立快照，再读取原表。启用“上传后自动启动 AI 识别”后，后台队列继续处理；也可使用“AI 识别整份”或“AI 识别本页”。
+2. AI 独立查看每页概览和四个重叠高清分块，同时读取带 ID 和坐标的 PDF 原文/OCR。已有规则的候选框不限制 AI 能看到的区域；已隔离的整表页不发给 AI，混合页仅发送屏蔽表区的视图；其他页面不会因分类不同而被排除。
+3. 常规调用使用 `medium`，输出位号、型号、角色、采购范围、包围框及原文引用。程序检查结构、坐标、型号与引用文字及位置的吻合程度，并检测跨页同位号冲突。
+4. 发现疑点的页面使用 `high` 重读原图和原文；默认最多复核 6 页，重复模板数量和跨页冲突优先，其余疑点保留人工审核。没有型号时不按经验补采购订货号。
+5. 按功能/位置/位号归并同一设备的线圈、触点和跨页表示，数量不按符号次数累加。端子排先按位号归集，再将带编号、型号和端子图形坐标的独立位置按型号拆成采购行；同排仅首位标型号时，只有在图形与编号连续且无第二种明文型号的条件下才继承，逐位保留推断证据并提示审核。同页重号提示审核，跨页重号或图形证据缺失时数量留空。电缆米数未核定时数量为空。无位号、仅触点、内部结构和成套关系保留审核。图内物料表保留在 `declared_parts`，不回填独立事实；主 BOM 来自 `independent_bom` 并应用工程师的人工决定。
+6. 型号与原文及位置吻合时，可补入未解决的自动识别行；已有明确型号出现冲突时提出审核项。人工修改、已确认物料和删除决定受到保护。合并前另存历史快照。
+
+### 原理图独立识别与图内清单核对
+
+新项目统一采用 `independent-schematic-v1`：`schematic_only.pdf` 是 AI 和离线提取共用的隔离视图，保留原页码。`isolation_plan.json` 记录表区、排除页、混合页及 SHA256；`independent_snapshot.json` 在读取原表前落盘，`declared_parts.json` 仅保存原表行。AI 缓存使用隔离视图哈希及新 agent 版本，视图缺失或被修改时拒绝识别，禁止回退到含答案的原件。未见过的表格布局仍需检查隔离视图；自动表区检测不等于所有版式均已验收。
+
+“清单核对”分别展示两侧证据，区分字段一致、差异、仅原表有、仅原理图有、对应歧义和原表不可用。优先按完整位号匹配；未限定柜体的位号仅在候选唯一时匹配。`KA` 与 `KA0`、`KM1` 与 `KM1-1` 不自动合并；组合件、未明确数量及单位保留审核。原表范围写法仅用于建立成员关联，绝不据此推算数量。
+
+人工采纳原表型号仅改工作 BOM 的 `model`，保留 `raw_model`，记录 `model_origin=drawing_parts_list_confirmed` 和 `parts_reference_id`。仅原表有的记录可显式人工补入，采购数量留空，原表数字只作候选。后续 AI 先在独立快照上合并，再应用人工保护，不把人工采用的表内答案当识别输入。核对依据变化后旧决定重置为待审核并保留之前的决定。
+
+历史部件表项目不自动迁移，原结果和人工记录保持原样。界面“按新流程建立独立分析项目”调用 `POST /api/projects/{id}/independent-analysis`，复用原始分页视图建立新项目，不重新转换 DWG，也不自动发起付费 AI。旧项目的 AI / 重新提取入口会提示先另建。新项目可显式启动 AI。完整诊断 Excel 保留“原理图独立快照”“图内清单原文”“原理图与清单核对”三个工作表；外部 Agent 的 context 接口也分开返回这些来源。
+
+### 采购审核与选型
+
+图纸型号 `raw_model`、当前采购型号 `model`、原图参数 `specification` 和企业选型建议 `selection_suggestions` 分开保存。PLC附件、断路器附件、企业按钮系列等建议不会自动改写图纸型号。网页可在位号明细中人工采纳或忽略，采纳后保留原始型号与证据。
+
+数量 `null` 表示没有建立采购数量或长度，不能用0或1代替。重复模板范围标注会产生数量审核和候选数，不自动按一个位号计一套，也不直接按范围倍增所有物料。仅触点而无已知实体、组件边界不清的区域须确认。采购汇总按型号、参数、范围、实体关系及数量依据分别归并，未知数量材料保持独立。
+
+网页双击行可修改参数、数量、采购范围、所属组件。采购待办分别显示待选型、待核数量/长度、待核范围与组件关系；保存、重启、Excel及JSON均保留这些状态。Excel追加原图参数、数量依据、候选数、选型建议和采购待办，并记录AI实际处理页码与版本。
+
+`GET /api/projects/{project_id}/agent/context` 是供外部Agent读取的版本化HTTP接口，返回逐项事实、证据、审核项、采购待办和AI处理记录。MCP适配可调用此接口；当前未实现MCP协议服务，也不要求员工在Codex中操作。修改仍通过已有审核API执行。
+
+任务状态和逐页缓存保存在 `output/<项目>/ai_jobs/` 与 `ai_cache/`，不含密钥。缓存按源 PDF、页面、模型、接口、思考程度及输入证据区分；重复任务可复用成功页面。取消或达到预算边界时不合并本次尚未提交的结果。重启后，中断任务显示为可重试，避免无提示重新消耗模型额度。
+
+任务面板显示进度、错误、API 次数及接口返回 Token 用量；这些用量不是实际账单。默认限制为 80 次调用、100 万 Token 预算并预留下一次调用空间；服务未返回的失败请求用量无法纳入统计。
+
+当前采用单进程本地后台队列，逐任务处理。请保持单个 Uvicorn worker；多实例部署需要共享数据库和独立任务队列。`localhost` 中转地址用于本机测试，部署服务器时应改为服务器可访问的模型服务地址；Windows 本机 DPAPI 凭据不能直接拷贝到另一台服务器使用。
+
+## 提取与评测
+
+```powershell
+python skills/electrical-bom-extractor/scripts/extract_bom.py --pdf "参考文件/3-C26368.pdf" --output-dir "output/cli_C26368"
+python skills/electrical-bom-extractor/scripts/extract_bom.py --pdf "参考文件/3-C26368.pdf" --output-dir "output/cli_C26368" --ground-truth "参考文件/3-C26368 bom20261102.xlsx"
 python scripts/evaluate_benchmark.py
-python -m pytest tests/test_pipeline.py -v
 ```
 
-### 方式 3：一键训练本厂专属 YOLOv11 电气符号模型（可选自进化）
+评测按型号、位号等业务字段进行一对一匹配，序号不作为物料身份。报告同时列出缺失、多余和字段差异，并给出召回率、精确率和准确率；只有没有任何差异时，`whole_bom_exact` 才为真。型号不确定、辅材估算和规则补全不等同于原图明确选型。
+
+图文核对遍历观察到的设备位号，不限定 FU2、F8 或固定页码。未标型号的对称支路保留待定，系统不会仅凭 KM1/KM2 的编号复制额定型号。
+
+## 新图纸适配与提取诊断
+
+支持带页码前缀和小数编号的 IEC/EPLAN 位号（如 `-10QF1`、`-21A1`、`-K0.0`），并用功能/柜体位置区分相同局部位号。型号可出现在描述中；大型模块结合图形边框进行关联，不能仅依赖固定距离和厂商白名单。
+
+质量提示统计可读页数、候选位号、已有型号、待核实型号和未关联型号。这些数量不等于完整 BOM 召回率，也不等于型号正确率。每行保留位号与型号文字的原图证据。系统未提取到型号时显示“未提取到型号”，不宣称原图没有标注。
+
+未知型号的不同设备保持独立，不自动按相同名称汇总成同一物料。现场负载在默认柜内采购范围下进入可恢复的过滤列表。企业系列建议默认关闭；开启 `panel_series_rules.enable_automatic_series_selection` 后只生成待审核建议。导线估算默认关闭，`auxiliary_estimation_rules.enable_automatic_quantity_estimation` 开启后属于工程估算，必须与明文长度区分。
+
+新增的参考图纸回归用实际页面核实电表、断路器、变频器、PLC 和通信设备的型号，同时验证端子名不会成为型号、无位号的模块型号不会关联给邻近开关。
+
+## 符号训练样本
+
+自动提取的文字坐标框、待审核结果和历史未确认标签不直接用于训练。工程师框选实际符号并选择符号类型后，审核通过的框才会进入托管训练清单；线圈、主触点和辅助触点按各自符号类型归类。
+
+训练与验证按独立项目划分，至少需要两个项目。旧标签保留在磁盘中供复查，但不在新的训练清单里；删除或修正元件后，重新归档会同步清理对应旧标注。
+
 ```powershell
-pip install ultralytics -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install ultralytics
 python dataset/yolo_electrical/train_yolo11.py
 ```
+
+## 测试
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q tests
+```
+
+测试使用临时项目和训练目录，禁止外部模型请求，不修改实际审核数据。包括三份参考 PDF 的端到端检查，以及重启恢复、采购数量调整、AI 补件、路径限制、密钥保护、旋转坐标、Excel 位号文本、评测匹配和训练集隔离的回归测试。

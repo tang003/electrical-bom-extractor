@@ -6,5 +6,5 @@ echo   正在启动服务，浏览器将自动打开: http://127.0.0.1:8000
 echo ============================================================================
 cd /d "%~dp0"
 start "" "http://127.0.0.1:8000"
-python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000
+python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 pause

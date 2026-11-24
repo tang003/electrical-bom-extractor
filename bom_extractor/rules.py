@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -20,28 +21,40 @@ def build_aggregated_from_itemized(itemized_items: List[BOMItem]) -> List[BOMIte
     Group itemized BOM rows by (brand, name, model, unit) to produce a consolidated
     procurement summary table (`合并采购汇总表`), preserving all tags and evidences.
     """
-    grouped: Dict[Tuple[str, str, str, str], BOMItem] = {}
-    order_keys: List[Tuple[str, str, str, str]] = []
+    grouped: Dict[tuple, BOMItem] = {}
+    order_keys: List[tuple] = []
 
     for it in itemized_items:
+        name = it.name
+        if it.procurement_name and it.source_type == SourceType.EXPLICIT.value and it.raw_model == it.model:
+            name = it.procurement_name
         key = (
             (it.brand or "").strip(),
-            (it.name or "").strip(),
+            (name or "").strip(),
             (it.model or "").strip(),
             (it.unit or "个").strip(),
+            it.specification.strip(), it.procurement_scope, it.entity_role, it.parent_tag,
+            it.quantity_status, it.quantity_basis,
+            it.model_origin if it.entity_role == 'terminal' and it.model_origin == 'terminal_strip_inference' else '',
+            (it.group_identity or it.id) if it.quantity is None or (it.category != "auxiliary" and (it.source_type == SourceType.UNRESOLVED.value or not it.model or it.model.startswith(("未提取", "图纸未注")))) else "",
         )
         if key not in grouped:
             cloned = copy.deepcopy(it)
+            cloned.name = name
             cloned.tags = list(it.tags) if it.tags else ([it.tag] if it.tag else [])
+            cloned.member_ids = [it.id]
             grouped[key] = cloned
             order_keys.append(key)
         else:
             agg = grouped[key]
-            agg.quantity += it.quantity
+            agg.quantity = None if agg.quantity is None or it.quantity is None else agg.quantity + it.quantity
+            agg.member_ids.append(it.id)
             for tg in (it.tags or [it.tag]):
                 if tg and tg not in agg.tags:
                     agg.tags.append(tg)
             agg.evidences.extend(it.evidences)
+            if agg.model_origin!=it.model_origin:agg.model_origin='mixed'
+            agg.parts_reference_id=','.join(dict.fromkeys(filter(None,[*agg.parts_reference_id.split(','),it.parts_reference_id])))
             if it.needs_review:
                 agg.needs_review = True
 
@@ -49,10 +62,8 @@ def build_aggregated_from_itemized(itemized_items: List[BOMItem]) -> List[BOMIte
     for idx, key in enumerate(order_keys, start=1):
         agg = grouped[key]
         agg.seq_no = idx
-        agg.id = f"agg_{idx}"
-        if len(agg.tags) > 6:
-            agg.tag = ", ".join(agg.tags[:6]) + f" 等({len(agg.tags)}个)"
-        elif agg.tags:
+        agg.id = "agg_" + hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()[:16]
+        if agg.tags:
             agg.tag = ", ".join(agg.tags)
         pages = sorted({ev.page for ev in agg.evidences}) if agg.evidences else [agg.primary_page]
         if len(pages) > 1:
@@ -74,103 +85,48 @@ def apply_engineering_rules(
     - Return (itemized_bom, aggregated_bom, filtered_items, review_items)
     """
     filter_cfg = rules_config.get("filter_rules", {})
-    exclude_zero = filter_cfg.get("exclude_zero_quantity", True)
-    placeholder_patterns = [re.compile(p) for p in filter_cfg.get("exclude_placeholder_models", [])]
-    plc_rules = rules_config.get("plc_accessory_rules", [])
-
-    if extraction_mode == "PART_LIST_MODE":
-        kept_items: List[BOMItem] = []
-        filtered_items: List[BOMItem] = []
-        plc_completed_notes: List[str] = []
-
-        for item in raw_items:
-            # 1. Check zero quantity
-            if exclude_zero and item.quantity <= 0:
-                item.review_note = "原图部件列表中数量为 0（未安装占位件），已自动剔除"
-                filtered_items.append(item)
+    patterns = [re.compile(p) for p in filter_cfg.get("exclude_placeholder_models", [])]
+    kept, filtered = [], []
+    completed = []
+    normalize = lambda value: re.sub(r"\s+", "", value).upper()
+    for original in raw_items:
+        item = copy.deepcopy(original)
+        if item.category == "field_load" and filter_cfg.get("exclude_field_loads_in_schematic", True):
+            item.review_note = "原理图现场负载，按默认柜内采购范围过滤；可在已过滤列表恢复。"
+            filtered.append(item)
+            continue
+        if (filter_cfg.get("exclude_zero_quantity", True) and item.quantity is not None and item.quantity <= 0) or any(p.fullmatch(item.model.strip()) for p in patterns):
+            item.review_note = "按企业规则过滤的零数量或非电控采购件，可人工恢复"
+            filtered.append(item)
+            continue
+        for rule in rules_config.get("plc_accessory_rules", []):
+            if normalize(item.model.split("+")[0]) != normalize(rule["match_model"]):
                 continue
-
-            # 2. Check placeholder field models (DT1~DT17, SP1~SP8, LF60D hydraulic station parts)
-            if any(pat.match(item.model.strip()) for pat in placeholder_patterns):
-                item.review_note = f"非电控柜采购件/现场液压站部件 (`{item.model}`, 备注:{item.remark or '无'})，已按工程规则自动过滤"
-                filtered_items.append(item)
-                continue
-
-            # 3. Apply PLC accessory completion rules
-            for pr in plc_rules:
-                if item.model.strip() == pr["match_model"]:
-                    item.model = item.model.strip() + pr["append_model"]
-                    item.source_type = SourceType.RULE_COMPLETED.value
-                    item.review_note = pr["reason"]
-                    plc_completed_notes.append(f"序号 {item.seq_no} [{item.name}] `{pr['match_model']}` -> `{item.model}` ({pr['reason']})")
-
-            kept_items.append(item)
-
-        if plc_completed_notes:
-            cpu_or_ai = next((it for it in kept_items if it.source_type == SourceType.RULE_COMPLETED.value), kept_items[0])
-            review_items.append(
-                ReviewItem(
-                    id="rev_plc_accessories",
-                    severity="INFO",
-                    issue_type="RULE_COMPLETED",
-                    tag="=02-CPU1511 / =02-AI1",
-                    title="企业选型规则补全：西门子 S7-1500 CPU 及 8AI 模块已自动追加导轨、存储卡与前连接器",
-                    description="；".join(plc_completed_notes),
-                    suggestion="已按企业标准 BOM 规则自动补齐必配附件，点击可定位至对应行。",
-                    page=cpu_or_ai.primary_page,
-                    norm_bbox=cpu_or_ai.primary_bbox,
-                    status="PENDING",
-                    action_type="CONFIRM",
-                )
-            )
-
-        if filtered_items:
-            review_items.append(
-                ReviewItem(
-                    id="rev_filtered_hydraulic",
-                    severity="INFO",
-                    issue_type="FILTERED_ITEM",
-                    tag="DT1~17, SP1~8, SPD",
-                    title=f"工程清洗规则：已自动剔除 {len(filtered_items)} 项非电控采购/0数量物料（可随时恢复）",
-                    description=(
-                        f"已自动过滤：电磁阀占位号 `DT1~DT17` (17项)、压力传感器占位号 `SP1~SP8` (8项)、"
-                        f"液压站液位开关 `LF60D` (1项) 及数量为 0 的浪涌保护器 `-SPD` (1项)，保留汇川伺服电机与控制器。"
-                    ),
-                    suggestion="可在右侧【已过滤备查】标签页中查看全部 27 项被过滤记录，或点击一键恢复至 BOM。",
-                    page=filtered_items[0].primary_page,
-                    norm_bbox=filtered_items[0].primary_bbox,
-                    status="PENDING",
-                    action_type="CONFIRM",
-                )
-            )
-
-        aggregated_bom = build_aggregated_from_itemized(kept_items)
-        return kept_items, aggregated_bom, filtered_items, review_items
-
-    else:
-        # SCHEMATIC_MODE: raw_items is already consolidated by physical device model (38 items for C26368)
-        aggregated_bom = copy.deepcopy(raw_items)
-        itemized_bom = copy.deepcopy(raw_items)
-
-        review_items.append(
-            ReviewItem(
-                id="rev_xb2_series_mapping",
-                severity="INFO",
-                issue_type="RULE_COMPLETED",
-                tag="HL0~HL23, -SB1~4, -ES1, -KA*",
-                title="企业标准选型映射：未标型号的面板指示灯/按钮/中间继电器已按施耐德 XB2/RXM 系列补全",
-                description=(
-                    "根据第 7、8 页明确标注的旋钮型号 `XB2BD21C / XB2BD31C`，系统自动将同柜未标具体订货号的面板元件映射为施耐德 XB2 系列："
-                    "白灯 `XB2BVB1LC`(1)、绿灯 `XB2BVM3LC`(5)、红灯 `XB2BVM4LC`(7)、黄灯 `XB2BVM5LC`(11)、"
-                    "急停 `XB2BS542C`(1)、启动按钮 `XB2BA31C`(4)、蜂鸣器 `XB2BSB4LC`(1)；"
-                    "中间继电器 `-KA` 映射为 `RXM2LB2BD+RXZE1M2C`(30)；马达断路器 `GV2ME` 因第6/14页用到辅助触点 `-FR3~5` 自动追加 `+GVAE11`。"
-                ),
-                suggestion="所有规则补全项均已打上 [规则补全] 标签，工程师可在网页表格中直接双击修改。",
-                page=7,
-                norm_bbox=[0.08, 0.15, 0.90, 0.75],
-                status="PENDING",
-                action_type="CONFIRM",
-            )
-        )
-
-        return itemized_bom, aggregated_bom, [], review_items
+            existing = {normalize(part) for part in item.model.split("+")}
+            additions = [part for part in rule["append_model"].split("+") if part and normalize(part) not in existing]
+            if additions:
+                proposal=item.model + "+" + "+".join(additions)
+                if not any(s.get('model')==proposal for s in item.selection_suggestions):
+                    item.selection_suggestions.append({"model":proposal,"reason":rule["reason"],"source":"enterprise_rule","status":"PENDING"})
+                item.needs_review = True
+                completed.append(item)
+        kept.append(item)
+    reviews = copy.deepcopy(review_items)
+    if completed:
+        reviews.append(ReviewItem(id="rev_plc_accessories", severity="INFO", issue_type="RULE_COMPLETED",
+            tag=", ".join(it.tag for it in completed), title="PLC 附件选型建议，未改写图纸型号",
+            description="；".join(f"{it.tag}: {it.selection_suggestions[-1]['model']}" for it in completed),
+            suggestion="核实前连接器、导轨和存储卡是否符合项目要求", page=completed[0].primary_page,
+            norm_bbox=completed[0].primary_bbox))
+    if filtered:
+        reviews.append(ReviewItem(id="rev_filtered_items", severity="INFO", issue_type="FILTERED_ITEM",
+            tag=", ".join(it.tag for it in filtered), title=f"已过滤 {len(filtered)} 项物料，可人工恢复",
+            description="；".join(f"{it.tag}: {it.model}, 数量 {it.quantity}" for it in filtered),
+            suggestion="请在过滤列表中核实采购范围", page=filtered[0].primary_page, norm_bbox=filtered[0].primary_bbox))
+    series = [it for it in kept if it.source_type == SourceType.RULE_COMPLETED.value]
+    if series and extraction_mode == "SCHEMATIC_MODE":
+        reviews.append(ReviewItem(id="rev_series_mapping", severity="INFO", issue_type="RULE_COMPLETED",
+            tag=", ".join(it.tag for it in series), title=f"{len(series)} 项企业选型规则补全待确认",
+            description="型号或附件来自企业配置，请逐项核实", suggestion="核实电压、颜色、触点和附件规格",
+            page=series[0].primary_page, norm_bbox=series[0].primary_bbox))
+    return kept, build_aggregated_from_itemized(kept), filtered, reviews

@@ -1,194 +1,35 @@
 from __future__ import annotations
 import math
 import re
+import hashlib
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import pymupdf
 
 from .classifier import extract_visual_spans
-from .models import BOMItem, ReviewItem, EvidenceLocation, SourceType, PageInfo
+from .cad_import import cad_join_tag_fragments
+from .cad_rack import read_rack
+from .models import BOMItem, ReviewItem, EvidenceLocation, SourceType, PageInfo, PageType
 from .vision import VisionRecognizer
+from .ocr_engine import DualChannelOCREngine
+
+
+from .notation import (BREAKER_FAMILIES, COMPONENT_TAG_RE, MODEL_TOKEN_RE, POWER_CURRENT_LABEL, tagged_model_series, with_component_anchors, device_code, local_tag, qualify_tag,
+                       is_connection_tag, is_field_load, model_compatible, model_family)
+from .spatial_binding import bind_models, device_captions
+from .procurement import range_annotations, flag_template_quantities, suggest
+from .terminal_positions import terminal_positions, apply_terminal_positions, vector_terminal_symbols
+from .reconciliation import norm
+
+IGNORE_TAG_PREFIXES = ("-X", "=+-X", "-W", "-PE", "-M", "-YV", "DT", "-DT", "SP", "-SP")
 
 
 def _dist(s1: Dict[str, Any], s2: Dict[str, Any]) -> float:
     return math.hypot(s1["cx"] - s2["cx"], s1["cy"] - s2["cy"])
 
 
-def _infer_component_name_and_brand(tag: str, model: str) -> Tuple[str, str]:
-    t = tag.upper().lstrip("-=+")
-    m = model.upper()
-    brand = ""
-    if any(k in m for k in ("LC1", "EZD", "GV2", "LRD", "IC65", "XB2", "RXM", "ATV", "NSX")):
-        brand = "施耐德"
-    elif any(k in m for k in ("6ES7", "6AV", "3RT", "3RV", "5SU", "SIEMENS")):
-        brand = "西门子"
-    elif any(k in m for k in ("HDR-", "NDR-", "EDR-", "MW")):
-        brand = "明纬(MW)"
-    elif any(k in m for k in ("ES680", "MD500", "RXLG", "MEG", "INOVANCE")):
-        brand = "汇川"
-    elif "NHR-" in m:
-        brand = "虹润"
-    elif any(k in m for k in ("CHNT", "NB1", "NXB", "BH-0.66", "SG-")):
-        brand = "正泰"
-
-    if t.startswith("QF") or t.startswith("F"):
-        name = "马达保护断路器" if "GV2" in m else ("熔断器" if t.startswith("FU") else "断路器")
-    elif t.startswith("KM"):
-        name = "交流接触器"
-    elif t.startswith("FR"):
-        name = "热继电器"
-    elif t.startswith("KA") or t.startswith("K"):
-        name = "时间继电器" if t.startswith("KT") else "中间继电器"
-    elif t.startswith("KT"):
-        name = "时间继电器"
-    elif t.startswith("HL") or t.startswith("H"):
-        name = "指示灯"
-    elif t.startswith("SB"):
-        name = "按钮开关"
-    elif t.startswith("SA"):
-        name = "旋转开关"
-    elif t.startswith("ES"):
-        name = "急停按钮"
-    elif t.startswith("BZ"):
-        name = "蜂鸣器"
-    elif t.startswith("V") or t.startswith("MW") or t.startswith("U"):
-        name = "开关电源/模块"
-    elif t.startswith("T") and not t.startswith("TI"):
-        name = "控制变压器"
-    elif t.startswith(("LI", "TI", "PI", "FI")):
-        name = "智能显示调节仪"
-    elif t.startswith("FAN"):
-        name = "风扇+过滤网"
-    elif t.startswith("SQ"):
-        name = "行程开关"
-    else:
-        name = "电气元器件"
-    return name, brand
-
-
-def extract_generic_schematic_components(
-    doc: pymupdf.Document,
-    pages_info: List[PageInfo],
-    page_spans_map: Dict[int, List[Dict[str, Any]]],
-    tag_evidences: Dict[str, List[EvidenceLocation]],
-    rules_config: Dict[str, Any],
-) -> Tuple[List[BOMItem], List[ReviewItem]]:
-    """
-    General-purpose dynamic spatial extractor for ANY unknown pure schematic PDF:
-    1. Identifies all unique component tags across all pages (excluding wires & terminal numbers).
-    2. For each tag occurrence on a page, searches within spatial radius (< 85pt) for model strings.
-    3. Deduplicates cross-page occurrences (coils + main/aux contacts) into physical devices.
-    4. Flags tags that have no nearby model text into `review_items` for human/AI confirmation.
-    """
-    model_regex = re.compile(
-        r"^(?:EZD|LC1|LRD|GV2|i?C65|HDR|NDR|XB2|RXM|NHR|6ES7|6AV|ES680|RXLG|SG-|BH-|OSMFU|EA9|E834|EKI-|GW6L|NTK1|ZB2)[A-Za-z0-9\-\*/\+,\s]{1,28}$",
-        re.IGNORECASE,
-    )
-    ignore_prefixes = ("-X", "=+-X", "-W", "-PE", "-M1", "-M2", "-M3", "-M4", "-YV")
-
-    tag_bound_models: Dict[str, List[Tuple[str, int, List[float]]]] = {}
-
-    for pno, spans in page_spans_map.items():
-        tag_spans = [
-            s for s in spans
-            if re.match(r"^(-?[A-Z]{1,4}\d+(?:-\d+)?|FR\d+|HL\d+|SQ(?:-1|\d+)?)$", s["text"].strip())
-        ]
-        model_spans = [
-            s for s in spans
-            if model_regex.match(s["text"].strip())
-            and not re.match(r"^\d+\*\d+\*\d+$", s["text"].strip())
-        ]
-        for ts in tag_spans:
-            raw_t = ts["text"].strip()
-            norm_t = raw_t if raw_t.startswith(("HL", "FR", "SQ", "-")) else f"-{raw_t}"
-            if norm_t.startswith(ignore_prefixes):
-                continue
-            # Find nearest model span within 85 points
-            best_m = None
-            best_d = 85.0
-            for ms in model_spans:
-                d = _dist(ts, ms)
-                if d < best_d:
-                    best_d = d
-                    best_m = ms
-            if best_m:
-                tag_bound_models.setdefault(norm_t, []).append(
-                    (best_m["text"].strip(), pno, best_m["norm_bbox"])
-                )
-
-    raw_items: List[BOMItem] = []
-    review_items: List[ReviewItem] = []
-    seq = 0
-
-    for norm_t, evs in sorted(tag_evidences.items(), key=lambda kv: (kv[1][0].page, kv[0])):
-        if norm_t.startswith(ignore_prefixes):
-            continue
-        bound = tag_bound_models.get(norm_t, [])
-        models_found = list({b[0] for b in bound})
-        model_val = models_found[0] if models_found else ""
-        name_val, brand_val = _infer_component_name_and_brand(norm_t, model_val)
-        primary_ev = evs[0]
-        pages_sorted = sorted({e.page for e in evs})
-        p_label = ", ".join(f"第{p}页" for p in pages_sorted[:4])
-
-        seq += 1
-        needs_rev = len(models_found) != 1
-        rev_note = ""
-        if len(models_found) > 1:
-            rev_note = f"跨页型号冲突: {models_found}"
-            review_items.append(
-                ReviewItem(
-                    id=f"rev_conflict_{seq}",
-                    severity="CONFLICT",
-                    issue_type="PARAM_MISMATCH",
-                    tag=norm_t,
-                    title=f"同位号跨页型号不一致：[{norm_t}] 检出多个型号 {models_found}",
-                    description=f"位号 `{norm_t}` 在不同页面关联到了不同型号文本：{models_found}。",
-                    suggestion="请点击定位核实原图，或点击右上角使用 AI 视觉模型辅助确认。",
-                    page=primary_ev.page,
-                    norm_bbox=primary_ev.norm_bbox,
-                )
-            )
-        elif not model_val:
-            rev_note = "原图仅标注位号，未在邻近区域检出明文型号"
-            review_items.append(
-                ReviewItem(
-                    id=f"rev_nomodel_{seq}",
-                    severity="WARNING",
-                    issue_type="UNRESOLVED_MODEL",
-                    tag=norm_t,
-                    title=f"待确认型号：位号 [{norm_t}] ({name_val}) 未检出明文型号",
-                    description=f"在第 {primary_ev.page} 页检出元器件位号 `{norm_t}`，但周围 85pt 范围内无标准型号文字（可能省略标注或为曲线文字）。",
-                    suggestion="可在右侧表格直接双击填入型号，或点击左侧【✨ AI 视觉识别本页】调用视觉大模型识别。",
-                    page=primary_ev.page,
-                    norm_bbox=primary_ev.norm_bbox,
-                )
-            )
-
-        raw_items.append(
-            BOMItem(
-                id=f"gen_{seq}",
-                seq_no=seq,
-                tag=norm_t,
-                tags=[norm_t],
-                name=name_val,
-                model=model_val,
-                raw_model=model_val,
-                brand=brand_val,
-                unit="个",
-                quantity=1,
-                remark="",
-                pdf_page_label=p_label,
-                primary_page=primary_ev.page,
-                primary_bbox=primary_ev.norm_bbox,
-                evidences=evs,
-                source_type=SourceType.EXPLICIT.value if model_val else SourceType.RULE_COMPLETED.value,
-                needs_review=needs_rev,
-                review_note=rev_note,
-            )
-        )
-
-    return raw_items, review_items
+def _is_model_compatible_with_tag(tag: str, model_text: str) -> bool:
+    return model_compatible(tag, model_text)
 
 
 def _expand_norm_bbox(norm_bbox: List[float], pad_x: float = 0.02, pad_y: float = 0.02) -> List[float]:
@@ -200,728 +41,823 @@ def _expand_norm_bbox(norm_bbox: List[float], pad_x: float = 0.02, pad_y: float 
     ]
 
 
-def extract_from_schematic_pdf(
-    doc: pymupdf.Document,
+def _normalize_tag(raw_tag: str) -> str:
+    t = raw_tag.strip()
+    if t.upper().startswith(("HL", "FR", "SQ")):
+        return t.upper()
+    if not t.startswith(("-", "=", "+")):
+        return f"-{t.upper()}"
+    return t.upper() if t.startswith("-") else t
+
+
+def _preferred_device_caption(labels: List[str]) -> str:
+    """Resolve a short caption and a repeated-character plot/OCR variant."""
+    if not labels:
+        return ''
+    def clean(value):
+        return re.sub(r'([\u4e00-\u9fff])\1+', r'\1', value)
+    canonical = max((clean(label) for label in labels), key=len)
+    if not all(clean(label) in canonical for label in labels):
+        return ''
+    return next((label for label in labels if label == canonical), canonical)
+
+
+def _infer_component_name_and_brand(tag: str, model: str, nearby_texts: List[str]) -> Tuple[str, str]:
+    t = device_code(tag)
+    t = {'NFB':'QF','MCCB':'QF','MCB':'QF','MC':'KM','OCR':'FR','TH':'FR','INV':'TB','CR':'KA'}.get(t,t)
+    m = model.upper()
+    near_str = " ".join(nearby_texts)
+
+    # 1. Infer brand from model prefix (Industrial Brand Gene Dictionary)
+    brand = ""
+    if m.startswith("ACS"):
+        return "变频器", "ABB"
+    if m.startswith("EDS-") or "MOXA" in m:
+        return "工业以太网交换机", "MOXA"
+    if m.startswith("FBOX-"):
+        return "远程通信模块", "FLEXEM" if "FLEXEM" in near_str.upper() else "待定"
+    if m.startswith(("SMART", "6AV")):
+        return "触摸屏", "西门子"
+    if m.startswith("6ES7"):
+        return ("PLC CPU" if "CPU" in near_str.upper() or "1ST" in m else "PLC 模块"), "西门子"
+    if m.startswith("RM22"):
+        return "相序保护继电器", "施耐德"
+    if m.startswith("AMC"):
+        return "多功能电表", "待定"
+    if m.startswith("SXC-"):
+        return "脉冲控制器", "待定"
+    if any(k in m for k in ("LC1", "EZD", "NSX", "CVS", "GV2", "LRD", "IC65", "C65", "XB2", "ZB2", "RXM", "RXZE", "REXL", "ATV", "EA9")):
+        brand = "施耐德"
+    elif any(k in m for k in ("6ES7", "6EP", "6AV", "3RT", "3RV", "5SU", "5SY", "SIEMENS")):
+        brand = "西门子"
+    elif any(k in m for k in ("HDR-", "NDR-", "EDR-", "LRS-", "MW")):
+        brand = "明纬"
+    elif any(k in m for k in ("ES680", "MD500", "RXLG", "MEG", "INOVANCE")):
+        brand = "汇川"
+    elif "NHR-" in m:
+        brand = "虹润"
+    elif "LF60" in m:
+        brand = "PAKU"
+    elif any(k in m for k in ("UK-", "QUINT", "CLIPLINE", "PHOENIX")):
+        brand = "菲尼克斯"
+    elif any(k in m for k in ("CHNT", "NB1", "NXB", "CJX2", "BH-0.66", "SG-")):
+        brand = "正泰"
+
+    # 2. Infer standard component name
+    if tagged_model_series(tag, model) and any(POWER_CURRENT_LABEL.fullmatch(text.strip()) for text in nearby_texts):
+        return "功率设备（型式待核）", brand
+    if t == "HMI":
+        return "人机界面", brand
+    if t == "KPH":
+        return "相序保护继电器", brand
+    if t == "TB":
+        return "变频器/驱动器", brand
+    if t == "FD":
+        return "阀门/执行机构", brand
+    if t == "BP":
+        return "传感器/变送器", brand
+    if t == "M":
+        return "电机/现场负载", brand
+    if t in ("Y", "YV"):
+        return "电磁阀", brand
+    if t == "P":
+        return "仪表", brand
+    if t == "E":
+        return "照明/加热元件", brand
+    if t == 'L':
+        return ('电流互感器' if any('S1' in text or 'S2' in text for text in nearby_texts) else '电感/互感器（待核实）'), brand
+    if t.startswith('X'):
+        return ('调试插座' if 'POL' in near_str.upper() else '端子排/分配端子'), brand
+    if t == 'W':
+        return '电缆', brand
+    if t == "S":
+        return "急停按钮" if any("急停" in tok for tok in nearby_texts[:4]) else "开关/按钮", brand
+    if t == "Q" and any("选择开关" in tok for tok in nearby_texts[:4]):
+        return "转换开关", brand
+    if t == "G":
+        return "开关电源", brand
+    if t.startswith(("LI", "TI", "PI", "FI")):
+        name = "显示仪表"
+    elif t.startswith("FAN") or "风扇" in near_str:
+        name = "风扇+过滤网"
+    elif t.startswith("QF") or t.startswith("QS") or t == "Q" or t.startswith("F"):
+        if t == 'QS':
+            name = "隔离开关"
+        elif device_code(tag) == 'QF' and model and not model.startswith(('未提取', '图纸未注')) and not (
+            m.startswith(BREAKER_FAMILIES) or re.search(r'\b(?:MCCB|MCB|BREAKER)\b',m)
+        ):
+            name = "开关器件（型式待核）"
+        elif "GV2" in m or "马达" in near_str:
+            name = "马达保护断路器"
+        elif t.startswith("FU"):
+            name = "熔断器"
+        elif t.startswith("FR"):
+            name = "热继电器"
+        else:
+            name = "断路器"
+    elif t.startswith("KM"):
+        name = "交流接触器"
+    elif t.startswith("FR"):
+        name = "热继电器"
+    elif t.startswith("KT"):
+        name = "时间继电器"
+    elif t.startswith("KA") or t.startswith("K"):
+        name = "中间继电器"
+    elif t.startswith("HL") or t.startswith("H") or t.startswith("WL"):
+        if "B1" in m or "白" in near_str[:6]:
+            name = "白色指示灯"
+        elif "M3" in m or "绿" in near_str[:6]:
+            name = "绿色指示灯"
+        elif "M4" in m or "红" in near_str[:6]:
+            name = "红色指示灯"
+        elif "M5" in m or "黄" in near_str[:6]:
+            name = "黄色指示灯"
+        else:
+            name = "指示灯"
+    elif t.startswith("SB"):
+        name = "启动/控制按钮"
+    elif t.startswith("SA"):
+        name = "旋转开关"
+    elif t.startswith("ES"):
+        name = "急停按钮"
+    elif t.startswith("BZ"):
+        name = "蜂鸣器"
+    elif t.startswith("V") or t.startswith("PS") or "电源" in near_str:
+        name = "开关电源"
+    elif t.startswith(("TC", "TM", "T")) and not t.startswith("TI"):
+        name = "控制变压器"
+    elif t.startswith("SQ"):
+        name = "行程开关"
+    else:
+        name = "电气元器件"
+
+    return name, brand
+
+
+def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, inventory=None):
+    """Extract devices by scoped IEC identity and bind model text using drawn geometry."""
+    vision=VisionRecognizer(crops_dir=crops_dir)
+    page_spans_map={}
+    terminal_spans_map={}
+    terminal_symbols_map={}
+    observations={}
+    bindings={}
+    descriptions={}
+    cross_references={}
+    vector_findings=[]
+    cabinet_modules=[]
+    review_items=[]
+    title_numbers={}
+    page_grids={}
+    for info in pages_info:
+        page=doc[info.page_num-1]
+        terminal_symbols_map[info.page_num]=vector_terminal_symbols(page)
+        native=extract_visual_spans(page)
+        grid_labels={int(span['text']):span['cx'] for span in native
+                     if re.fullmatch(r'[0-9]',span['text'].strip()) and span['cy'] < .04 * info.height}
+        if len(grid_labels) >= 8:
+            page_grids[info.page_num]=grid_labels
+            info.extraction_diagnostics['drawing_grid_columns'] = [
+                {'number':number, 'x':round(cx / info.width, 5)}
+                for number,cx in sorted(grid_labels.items())]
+        spans=DualChannelOCREngine.extract_dual_channel_spans(page,native,dpi=200)
+        body=[sp for sp in spans if .02*info.height<sp['cy']<.90*info.height and .02*info.width<sp['cx']<.98*info.width]
+        # Terminal numbers can sit inside the right drawing margin (X9:10).
+        terminal_spans_map[info.page_num]=with_component_anchors(cad_join_tag_fragments([
+            sp for sp in spans if .02*info.height<sp['cy']<.90*info.height
+            and .005*info.width<sp['cx']<.995*info.width]))
+        # Native CAD often omits the IEC leading hyphen. Keep the literal label
+        # as evidence; canonicalize only the temporary binding input.
+        body=with_component_anchors(cad_join_tag_fragments(body))
+        page_spans_map[info.page_num]=body
+        if info.page_type in (PageType.COVER.value,PageType.CONTENTS.value):
+            info.extraction_diagnostics={**info.extraction_diagnostics,'native_characters':sum(len(sp['text']) for sp in native),'device_candidates':0,'model_candidates':0,'unbound_models':0,'excluded_connections':0}
+            continue
+        anchors=[]
+        connections=[]
+        for span in body:
+            raw=span['text'].strip()
+            if raw.startswith('-') and is_connection_tag(raw):
+                connections.append(raw)
+                continue
+            if not COMPONENT_TAG_RE.fullmatch(raw):
+                continue
+            tag=qualify_tag(_normalize_tag(raw), info.location_code, info.function_code)
+            anchor={**span,'tag':tag,'raw_tag':raw}
+            anchors.append(anchor)
+            near=sorted((o for o in body if o is not span and _dist(span,o)<75),key=lambda o:_dist(span,o))
+            coil=any(o['text'].upper() in ('A1','A2') for o in near)
+            role='coil' if coil else 'main_circuit' if info.page_type==PageType.MAIN_CIRCUIT.value else 'contact_or_symbol'
+            evidence=EvidenceLocation(info.page_num,span['bbox'],_expand_norm_bbox(span['norm_bbox'],.012,.015),raw_text=span.get('source_text',raw),role=role,device_tag=tag)
+            observations.setdefault(tag,[]).append({'evidence':evidence,'anchor':anchor,'near':[o['text'] for o in near],'location':info.location_code})
+            # An EPLAN /sheet.column marker immediately under a symbol points to
+            # another representation of this device. It is evidence, not a part.
+            for other in near:
+                reference = re.fullmatch(r'/([1-9]\d*)\.([0-9])', other['text'].strip())
+                if not reference:
+                    continue
+                gap = other['bbox'][1] - span['bbox'][3]
+                aligned = min(span['bbox'][2], other['bbox'][2]) >= max(span['bbox'][0], other['bbox'][0])
+                if -.3 * (span['bbox'][3] - span['bbox'][1]) <= gap <= 1.5 * (span['bbox'][3] - span['bbox'][1]) and aligned:
+                    cross_references.setdefault(tag, []).append((info.page_num, other, int(reference[1]), int(reference[2])))
+        modules,reserved_handles=read_rack(page,body,info)
+        cabinet_modules.extend(modules)
+        binding_spans=[s for s in body if s.get('handle') not in reserved_handles] if reserved_handles else body
+        bound,models,unbound,enclosures=bind_models(page,binding_spans,anchors)
+        # A code printed in the same title block across sheets is traceability
+        # evidence. Retain its position and avoid creating a purchasing task for it.
+        for candidate in unbound:
+            text=candidate['model_text']
+            if not re.fullmatch(r'[A-Z]{2,}\d{3,}',text,re.I):
+                continue
+            x,y=candidate['cx']/info.width,candidate['cy']/info.height
+            if min(x,y,1-x,1-y)>.18:
+                continue
+            nearby={s['text'].replace(' ','') for s in body
+                    if abs(s['cx']/info.width-x)<.12 and abs(s['cy']/info.height-y)<.12}
+            has_number='图号' in nearby or {'图','号'}<=nearby
+            has_customer='客户' in nearby or {'客','户'}<=nearby
+            if has_number and has_customer:
+                title_numbers.setdefault(text,[]).append((info.page_num,x,y))
+        for tag, labels in device_captions(body, anchors, enclosures).items():
+            descriptions.setdefault(tag, []).extend((info.page_num, sp) for sp in labels)
+        for tag,matches in bound.items():
+            bindings.setdefault(tag,[]).extend({**match,'page':info.page_num} for match in matches)
+        info.extraction_diagnostics={**info.extraction_diagnostics,'range_annotations':range_annotations(body, info.title),'native_characters':sum(len(sp['text']) for sp in native),
+            'device_candidates':len({a['tag'] for a in anchors}),'device_tags':sorted({a['tag'] for a in anchors}),'model_candidates':len(models),
+            'unbound_models':len(unbound),'excluded_connections':len(set(connections))}
+        info.extraction_diagnostics['unbound_evidence']=[{'text':m['model_text'],'norm_bbox':m['norm_bbox']} for m in unbound]
+        info.extraction_diagnostics['rack_slots']=len(modules)
+        findings=vision.analyze_vector_regions_on_page(page,native)
+        for finding in findings:
+            finding=dict(finding)
+            if finding.get('tag'):
+                finding['tag']=','.join(qualify_tag(_normalize_tag(t.strip()),info.location_code,info.function_code) for t in finding['tag'].split(','))
+            vector_findings.append(finding)
+
+    for info in pages_info:
+        diag=info.extraction_diagnostics
+        locations=[]
+        for evidence in diag.get('unbound_evidence',[]):
+            x0,y0,x1,y1=evidence['norm_bbox']
+            repeats={p for p,x,y in title_numbers.get(evidence['text'],[]) if abs(x-(x0+x1)/2)<.015 and abs(y-(y0+y1)/2)<.015}
+            if info.page_num in repeats and len(repeats)>=3:
+                diag.setdefault('title_block_evidence',[]).append(evidence)
+            else:
+                locations.append(evidence)
+        diag['unbound_evidence']=locations
+        diag['unbound_models']=len(locations)
+        if locations:
+            distinct=list(dict.fromkeys(m['text'] for m in locations))
+            signature=hashlib.sha256(str(locations).encode()).hexdigest()[:12]
+            examples='、'.join(distinct[:3])
+            review_items.append(ReviewItem(id=f'rev_unbound_p{info.page_num}_{signature}',severity='WARNING',issue_type='UNBOUND_MODEL',
+                tag='',title=f'第 {info.page_num} 页核对物料归属 · {examples}',
+                description=f'{len(locations)} 处原图文字尚未对应到设备，共 {len(distinct)} 种写法。请对照图上器件检查是否漏列采购件。',
+                suggestion='查看本页原图和文字位置，补录遗漏的实物或型号。',page=info.page_num,norm_bbox=locations[0]['norm_bbox']))
+        elif not diag.get('device_candidates') and not diag.get('rack_slots') and info.page_type in (PageType.PLC_WIRING.value,PageType.MAIN_CIRCUIT.value,PageType.CONTROL_CIRCUIT.value):
+            review_items.append(ReviewItem(id=f'rev_coverage_p{info.page_num}',severity='WARNING',issue_type='PAGE_COVERAGE',
+                tag='',title=f'第 {info.page_num} 页尚未定位设备',description='识别到了回路或 PLC 接线，但未建立设备明细。',
+                suggestion='核对本页是否有遗漏的设备，可使用本页 AI 识别。',page=info.page_num,norm_bbox=[.02,.02,.98,.90]))
+    # Resolve unscoped spelling variants before constructing any BOM rows.
+    # A scoped tag such as +B-FR1 identifies a separate device.
+    for alias in list(observations):
+        canonical = alias[1:] if re.fullmatch(r'-FR\d+', alias) else 'SQ' if alias == 'SQ-1' else None
+        if canonical not in observations:
+            continue
+        occurrences = observations.pop(alias)
+        for entry in occurrences:
+            entry['anchor']['tag'] = canonical
+            entry['evidence'].device_tag = canonical
+        observations[canonical].extend(occurrences)
+        observations[canonical].sort(key=lambda entry: entry['evidence'].page)
+        cross_references.setdefault(canonical, []).extend(cross_references.pop(alias, []))
+        bindings.setdefault(canonical, []).extend(bindings.pop(alias, []))
+        descriptions.setdefault(canonical, []).extend(descriptions.pop(alias, []))
+        for finding in vector_findings:
+            if finding.get('tag') == alias:
+                finding['tag'] = canonical
+    vector_by_tag={f['tag']:f for f in vector_findings if f.get('type')=='VECTOR_TEXT_MODEL'}
+    for candidate in (inventory or {}).get('devices', []):
+        tag=candidate['tag']
+        if tag in observations or not candidate['occurrences']:
+            continue
+        first=candidate['occurrences'][0]
+        review_items.append(ReviewItem(
+            id=f'rev_inventory_{tag}',severity='WARNING',issue_type='INVENTORY_UNBOUND',
+            tag=tag,title=f'全图位号尚未建立设备：{tag}',
+            description='位号盘点找到了该标记，设备符号或采购身份尚未建立。',
+            suggestion='核对图上位置，确认是独立设备、触点还是连接标记。',
+            page=first['page'],norm_bbox=first['bbox']))
+    page_by_number={info.page_num:info for info in pages_info}
+    sheets={}
+    for info in pages_info:
+        if info.sheet_no.isdigit():
+            sheets.setdefault(int(info.sheet_no), []).append(info.page_num)
+    items=[]
+    panel=rules_config.get('panel_series_rules',{})
+    use_defaults=bool(panel.get('enable_automatic_series_selection',False))
+    placeholder='未提取到型号(待核实)'
+    for tag,occurrences in sorted(observations.items(),key=lambda pair:(pair[1][0]['evidence'].page,pair[0])):
+        lt=local_tag(tag)
+        models = []
+        load_references = []
+        scope = tag.removesuffix(lt)
+        for match in bindings.get(tag, []):
+            referenced_tag = scope + '-' + match['model_text'].upper()
+            if (match['association'] == 'spatial' and referenced_tag in observations
+                    and referenced_tag != tag and is_field_load(referenced_tag)):
+                load_references.append(EvidenceLocation(
+                    match['page'], match['bbox'], match['norm_bbox'], raw_text=match['text'],
+                    role='field_load_reference', device_tag=referenced_tag))
+            else:
+                models.append(match)
+        concrete=[m for m in models if not model_family(m['model_text'])]
+        chosen=concrete or models
+        # A nearby label may belong to an adjacent device. Prefer a code printed
+        # on the tag or its own symbol. Equally supported codes require selection.
+        candidates={norm(m['model_text']):m['model_text'] for m in chosen}
+        owned={norm(m['model_text']) for m in chosen if m['association'] in ('inline','enclosure','cad_label','label_stack')}
+        possible=owned or set(candidates)
+        selected=candidates[next(iter(possible))] if len(possible)==1 else ''
+        distinct=list(candidates.values())
+        evidences=[entry['evidence'] for entry in occurrences] + load_references
+        for source_page, marker, sheet_number, column in cross_references.get(tag, []):
+            target_pages=sheets.get(sheet_number, [])
+            matches=[entry for entry in occurrences if entry['evidence'].page in target_pages
+                     and (column not in page_grids.get(entry['evidence'].page, {})
+                          or abs(entry['anchor']['cx'] - page_grids[entry['evidence'].page][column])
+                          <= .1 * page_by_number[entry['evidence'].page].width)]
+            column_verified=any(column in page_grids.get(page, {}) for page in target_pages)
+            evidences.append(EvidenceLocation(
+                source_page, marker['bbox'], marker['norm_bbox'], raw_text=marker['text'],
+                role='cross_reference', device_tag=tag,
+                cad_refs=[{'sheet':sheet_number,'column':column,'target_pages':target_pages,
+                           'resolved':bool(matches),'column_verified':column_verified}]))
+            if target_pages and not matches:
+                review_items.append(ReviewItem(
+                    id=f'rev_crossref_{tag}_{source_page}_{sheet_number}_{column}',severity='WARNING',
+                    issue_type='CROSS_REFERENCE_MISMATCH',tag=tag,title=f'跨页引用未对应到同位号：{tag}',
+                    description=f'第 {source_page} 页标注 {marker["text"]}，目标栏位附近未找到同一位号。',
+                    suggestion='核对引用页、栏位和目标位号。',page=source_page,norm_bbox=marker['norm_bbox'],
+                    related_page=target_pages[0]))
+        near=list(dict.fromkeys(t for entry in occurrences for t in entry['near']))
+        near.extend(m["text"] for m in models)
+        model=selected
+        source=SourceType.EXPLICIT.value if model else SourceType.UNRESOLVED.value
+        needs_review=not model or len(distinct)>1 or any(m.get('needs_review') for m in chosen) or bool(model and model_family(model))
+        note=''
+        if len(distinct)>1:
+            note=('同位号另有不同型号标注，请核实主件和附件。' if model else
+                  '同位号有多个型号候选，尚未确定本次采购型号。')
+            review_items.append(ReviewItem(id=f'rev_conflict_{tag}',severity='CONFLICT',issue_type='PARAM_MISMATCH',tag=tag,
+                title=f'同位号检出不同型号：{tag}',description=' / '.join(distinct),suggestion='请核实主件、附件及不同页标注是否一致',
+                page=evidences[0].page,norm_bbox=evidences[0].norm_bbox))
+        for match in chosen:
+            evidences.append(EvidenceLocation(match['page'],match['bbox'],match['norm_bbox'],raw_text=match['text'],
+                                              role='model_text' if norm(match['model_text']) in possible else 'model_candidate',
+                                              device_tag=tag,model_binding=match['association']))
+        if not distinct and tag in vector_by_tag:
+            finding=vector_by_tag[tag]
+            model=finding['model']
+            source=SourceType.VISION_RECOGNIZED.value
+            needs_review=True
+            note=finding.get('note','局部 OCR 识别，待核实')
+        proposed_model=''
+        if not distinct and not model and use_defaults:
+            code=device_code(tag)
+            if code=='KA':
+                proposed_model=panel.get('intermediate_relay',{}).get('model','')
+            elif code in ('ES','SB','BZ'):
+                key={'ES':'emergency_stop','SB':'push_button','BZ':'buzzer'}[code]
+                proposed_model=panel.get('buttons_and_switches',{}).get(key,{}).get('model','')
+            elif code=='HL':
+                for color,cfg in panel.get('indicator_lights',{}).items():
+                    if color in near:
+                        proposed_model=cfg.get('model','');break
+        if not model:
+            model=placeholder
+            if not distinct:
+                note='系统尚未可靠提取到型号；不代表原图没有标注，请核实原图或补充选型。'
+                review_items.append(ReviewItem(id=f'rev_unresolved_{tag}',severity='WARNING',issue_type='UNRESOLVED_MODEL',tag=tag,
+                    title=f'位号已识别，型号待核实：{tag}',description=note,suggestion='核对型号文字和关联位置，不能把未提取等同于图纸未注。',
+                    page=evidences[0].page,norm_bbox=evidences[0].norm_bbox))
+        elif needs_review and len(distinct)<2:
+            review_items.append(ReviewItem(id=f'rev_association_{tag}',severity='WARNING',issue_type='MODEL_ASSOCIATION',tag=tag,
+                title=f'型号关联/选型待确认：{tag}',description=note or f'识别到 {model}，请核实其与位号的对应关系及订货规格。',
+                suggestion='根据型号文字证据定位核实',page=evidences[0].page,norm_bbox=evidences[0].norm_bbox))
+        name,brand=_infer_component_name_and_brand(tag,model,near)
+        labels = descriptions.get(tag, [])
+        explicit_names = {"漏电保护断路器" if re.fullmatch(r'(?:[A-Z]+\+)?RCBO', span['text'], re.I)
+                          else span['text'] for _,span in labels}
+        preferred_name = _preferred_device_caption(list(explicit_names))
+        if preferred_name:
+            name = preferred_name
+            for page_num, span in labels:
+                evidences.append(EvidenceLocation(page_num, span['bbox'], span['norm_bbox'],
+                                                  raw_text=span['text'], role='device_description', device_tag=tag))
+        if name == "开关器件（型式待核）":
+            needs_review = True
+            note = "已读到开关型号，原图文字未明确具体开关型式，按订货号核实。"
+        if name == "功率设备（型式待核）":
+            needs_review = True
+            note = "图纸按型号系列和实例序号标识并给出功率电流，具体设备型式需核对。"
+        suggestions=[]
+        for rule in rules_config.get('breaker_normalization_rules',[]):
+            if rule.get('model') and re.fullmatch(rule['pattern'],model,re.I):
+                suggestions.append((rule['model'],rule.get('reason','企业型号选型建议')))
+        pages=sorted({ev.page for ev in evidences})
+        items.append(BOMItem(id=f'sch_{len(items)+1}',seq_no=len(items)+1,tag=tag,tags=[tag],local_tag=lt,
+            location_code=occurrences[0]['location'],placement=occurrences[0]['location'],name=name,brand=brand or '待定',
+            model=model,raw_model=selected,quantity=1,unit='个',
+            primary_page=evidences[0].page,primary_bbox=evidences[0].norm_bbox,evidences=evidences,
+            pdf_page_label=', '.join(f'第{p}页' for p in pages),source_type=source,
+            category='field_load' if is_field_load(tag) else 'primary',needs_review=needs_review,review_note=note))
+        item=items[-1]
+        if len(distinct) == 1 and concrete and name != '电气元器件' and any(
+            match['association'] == 'enclosure' for match in chosen
+        ):
+            item.procurement_name = name
+        if any(entry['anchor'].get('unindexed_tag') for entry in occurrences):
+            item.quantity=None;item.quantity_status='unknown';item.quantity_basis='unknown'
+            item.review_note+=' 原图位号未带数字编号，采购数量保留待核。'
+        code=device_code(tag)
+        item.procurement_scope='field' if is_field_load(tag) else 'unknown'
+        # Preserve literal parameters, owned by the closest printed tag, separately from a model.
+        parameters=[]
+        parameter_pattern=re.compile(r'^(?:(?:AC|DC)?\s*\d+(?:[.,]\d+)?\s*(?:A|V|KW|W|HZ)(?:\s*(?:AC|DC))?(?:(?:\s*[,，/]\s*|\s+)\d+P)?|'
+                                     r'\d+P(?:\s*[,，/]\s*|\s+)\d+(?:\.\d+)?\s*A|[BCD]\d+A/\d+P|'
+                                     r'\d+(?:[.,]\d+)?(?:[x×*G]\d+(?:[.,]\d+)?)+(?:\+\d+[x×*]\d+)?|.*POL.*)$',re.I)
+        for match in chosen:
+            if not selected or norm(match['model_text'])!=norm(selected):
+                continue
+            # CAD and PDF both print e.g. a contactor series and its current in one text entity.
+            suffix=re.fullmatch(re.escape(match['model_text'])+r'\s+[-–]?\s*(.+)',match['text'].strip(),re.I)
+            if suffix and parameter_pattern.fullmatch(suffix[1]) and suffix[1] not in parameters:
+                parameters.append(suffix[1])
+        for entry in occurrences:
+            pno=entry['evidence'].page;anchor=entry['anchor']
+            for sp in page_spans_map[pno]:
+                text=sp['text'].strip()
+                if not (parameter_pattern.fullmatch(text) or POWER_CURRENT_LABEL.fullmatch(text)) or _dist(anchor,sp)>65:
+                    continue
+                other_anchors=[o['anchor'] for obs in observations.values() for o in obs if o['evidence'].page==pno]
+                if any(_dist(a,sp)+2<_dist(anchor,sp) for a in other_anchors if a['tag']!=tag):
+                    continue
+                if sp['text'] not in parameters:
+                    parameters.append(sp['text'])
+                    item.evidences.append(EvidenceLocation(pno,sp['bbox'],sp['norm_bbox'],raw_text=sp['text'],role='specification',device_tag=tag))
+        item.specification='；'.join(parameters)
+        if code.startswith('X'):
+            item.entity_role='device' if 'POL' in item.specification.upper() else 'terminal'
+            item.category='primary' if item.entity_role=='device' else 'auxiliary'
+            if item.entity_role=='terminal':
+                item.unit='片';item.quantity=None;item.quantity_status='unknown';item.quantity_basis='terminal_positions_required'
+            else:item.name='调试插座'
+        elif code=='W':
+            item.entity_role='cable';item.category='auxiliary';item.unit='米';item.quantity=None
+            item.quantity_status='unknown';item.quantity_basis='length_required'
+        if proposed_model:suggestions.append((proposed_model,'企业系列选型建议，未作为图纸事实'))
+        for proposed,reason in suggestions:suggest(item,proposed,reason)
+    repeated_slots = {}
+    for module in cabinet_modules:
+        repeated_slots.setdefault(module.group_identity, []).append(module)
+    for group in repeated_slots.values():
+        for module in group:
+            if len(group)>1:
+                module.quantity=None
+                module.quantity_status='needs_confirmation'
+                module.quantity_basis='repeated_slot'
+                module.review_note+=' 同一安装范围出现相同槽号，请核实机架身份或重复图页。'
+            module.seq_no=len(items)+1
+            items.append(module)
+    # Attach GV2 fault-contact accessories only when the associated breaker and contact both exist.
+    by_tag={it.tag:it for it in items}
+    remove=set()
+    for item in items:
+        if 'GV2ME' in item.model.upper():
+            peer=item.tag.replace('QF','FR')
+            if peer in by_tag:
+                item.evidences.extend(by_tag[peer].evidences)
+                if '+GVAE11' not in item.model.upper():
+                    suggest(item,item.model+'+GVAE11','控制触点提示可能需辅助模块，请核对主件已含配置')
+                # A distinct FR tag is not deleted merely because its number resembles QF.
+    items=[it for it in items if it.tag not in remove]
+    review_items=[r for r in review_items if r.tag not in remove]
+    for finding in vector_findings:
+        if finding['type']=='UNRESOLVED_VECTOR_REGION':
+            review_items.append(ReviewItem(id=f"rev_vector_p{finding['page']}",severity='WARNING',issue_type='VECTOR_VISION',tag='',
+                title='矢量区域识别未完成',description=finding['note'],suggestion='请框选核实',page=finding['page'],norm_bbox=finding['norm_bbox']))
+        elif finding.get('tag') not in observations:
+            nb=finding['norm_bbox'];pno=finding['page']
+            sheet = doc[pno - 1].rect
+            bbox = [nb[0]*sheet.width, nb[1]*sheet.height, nb[2]*sheet.width, nb[3]*sheet.height]
+            items.append(BOMItem(id=f'ocr_{len(items)+1}',seq_no=len(items)+1,tag=finding['tag'],tags=[finding['tag']],
+                local_tag=local_tag(finding['tag']),name=finding['name'],model=finding['model'],raw_model=finding['model'],
+                brand=finding.get('brand','待定'),quantity=finding.get('quantity',1),primary_page=pno,primary_bbox=nb,
+                evidences=[EvidenceLocation(pno,bbox,nb,raw_text=finding['model'],role='rapidocr_vector',device_tag=finding['tag'])],
+                source_type=SourceType.VISION_RECOGNIZED.value,category='auxiliary' if finding['type']=='CABINET_DIMENSION' else 'primary',needs_review=True,review_note=finding.get('note','')))
+    if rules_config.get('auxiliary_estimation_rules',{}).get('enable_automatic_quantity_estimation',False):
+        aux,reviews=_extract_wires_and_terminals(pages_info,page_spans_map,max((it.seq_no for it in items),default=0),rules_config,vector_findings,len(items))
+        items.extend(aux);review_items.extend(reviews)
+    apply_terminal_positions(items, review_items, terminal_positions(
+        pages_info, terminal_spans_map, terminal_symbols_map))
+    flag_template_quantities(items,review_items,pages_info)
+    return items,review_items
+
+
+def _extract_wires_and_terminals(
     pages_info: List[PageInfo],
-    rules_config: Dict[str, Any],
-    crops_dir: Optional[Path] = None,
+    page_spans_map: Dict[int, List[Dict[str, Any]]],
+    start_seq: int,
+    rules_config: Optional[Dict[str, Any]] = None,
+    vector_findings: Optional[List[Dict[str, Any]]] = None,
+    control_device_count: int = 0,
 ) -> Tuple[List[BOMItem], List[ReviewItem]]:
     """
-    Extract physical components from pure CAD schematic PDFs (without embedded Part Lists),
-    performing spatial text-to-tag binding, VLM regional cropping for vector-outline text,
-    cross-page coil/contact deduplication, and symmetric topology inference.
+    PDF-driven wire gauge (mm²) + terminal strip extractor. No per-drawing constants:
+      1. Scan MAIN_CIRCUIT pages for explicit gauge annotations ('70 mm²', '16' + 'mm²', '4mm²4mm²4mm²').
+      2. Scan TERMINAL_DIAGRAM pages for strip headers (=+-X1 / -X2 ...), count the pins of each strip
+         (stopping at horizontal gaps so strips on the same row are not merged) and read the wire label
+         printed above every pin.
+      3. Resolve each pin's wire label on MAIN_CIRCUIT pages and attach the nearest gauge annotation
+         (same column first, then Euclidean). Pins without a resolvable gauge are control pins.
+      4. Map gauge -> terminal rating and estimate wire meters from conductor counts × cabinet size,
+         all via `wire_terminal_estimation` in rules_config.json. Everything is tagged ESTIMATED_AUX.
     """
-    vision = VisionRecognizer(crops_dir=crops_dir)
-    page_spans_map: Dict[int, List[Dict[str, Any]]] = {}
-    tag_evidences: Dict[str, List[EvidenceLocation]] = {}
-    vector_findings: List[Dict[str, Any]] = []
+    cfg = (rules_config or {}).get("wire_terminal_estimation", {})
+    rating_map: Dict[str, str] = cfg.get("gauge_to_terminal_rating", {})
+    control_rating: str = cfg.get("control_terminal_rating", "16A")
+    term_spare: float = float(cfg.get("terminal_spare_ratio", 0.0))
+    wire_spare: float = float(cfg.get("wire_spare_ratio", 0.1))
+    route_factor: float = float(cfg.get("route_factor", 1.0))
+    conductors_per_annotation: int = int(cfg.get("conductors_per_unmapped_annotation", 3))
+    control_gauge: str = cfg.get("control_wire_gauge", "1mm²")
+    control_runs_per_device: float = float(cfg.get("control_runs_per_device", 2.0))
+    incoming_poles: int = int(cfg.get("incoming_terminal_poles", 0))
+    default_cab = cfg.get("default_cabinet_mm", [1600, 800, 400])
+    wire_brand: str = cfg.get("wire_brand", "")
+    terminal_brand: str = cfg.get("terminal_brand", "")
 
-    # Step 1: Collect all visual spans and run vector/vision detection per page
+    items: List[BOMItem] = []
+    reviews: List[ReviewItem] = []
+    seq = start_seq
+
+    def _gv(g: str) -> float:
+        try:
+            return float(g.lower().replace("mm²", "").replace("mm2", "").strip())
+        except ValueError:
+            return 0.0
+
+    def _norm_gauge(num: str) -> str:
+        v = float(num)
+        return f"{int(v)}mm²" if v.is_integer() else f"{v}mm²"
+
+    # ---- 1. Gauge annotations on main-circuit pages (keep point coordinates for label matching) ----
+    gauge_marks: List[Dict[str, Any]] = []  # {gauge, page, bbox, norm_bbox, raw}
     for pinfo in pages_info:
-        page = doc[pinfo.page_num - 1]
-        spans = extract_visual_spans(page)
-        # Filter out title block at bottom (y > 530 on 612pt height) and border coordinates
-        content_spans = [
-            s for s in spans
-            if 0.03 * pinfo.height < s["cy"] < 0.87 * pinfo.height
-            and 0.02 * pinfo.width < s["cx"] < 0.98 * pinfo.width
-        ]
-        page_spans_map[pinfo.page_num] = content_spans
+        if pinfo.page_type not in (PageType.MAIN_CIRCUIT.value,):
+            continue
+        spans = page_spans_map.get(pinfo.page_num, [])
+        for s in spans:
+            txt = s["text"].strip()
+            m_all = re.findall(r"(\d+(?:\.\d+)?)\s*mm[²2]", txt, re.IGNORECASE)
+            if m_all:
+                for num in m_all:
+                    gauge_marks.append({
+                        "gauge": _norm_gauge(num), "page": pinfo.page_num, "bbox": s["bbox"],
+                        "norm_bbox": _expand_norm_bbox(s["norm_bbox"], 0.015, 0.015), "raw": txt,
+                    })
+                continue
+            if txt.lower() not in ("mm²", "mm2"):
+                continue
+            best, best_d = None, 22.0
+            for o in spans:
+                if o is s:
+                    continue
+                if re.match(r"^(?:0\.5|0\.75|1|1\.5|2\.5|4|6|10|16|25|35|50|70|95|120|150|185|240)$", o["text"].strip()):
+                    d = _dist(s, o)
+                    if d < best_d:
+                        best, best_d = o, d
+            if best is not None:
+                bx = [min(s["bbox"][0], best["bbox"][0]), min(s["bbox"][1], best["bbox"][1]),
+                      max(s["bbox"][2], best["bbox"][2]), max(s["bbox"][3], best["bbox"][3])]
+                nb = [min(s["norm_bbox"][0], best["norm_bbox"][0]), min(s["norm_bbox"][1], best["norm_bbox"][1]),
+                      max(s["norm_bbox"][2], best["norm_bbox"][2]), max(s["norm_bbox"][3], best["norm_bbox"][3])]
+                gauge_marks.append({
+                    "gauge": _norm_gauge(best["text"].strip()), "page": pinfo.page_num, "bbox": bx,
+                    "norm_bbox": _expand_norm_bbox(nb, 0.015, 0.015), "raw": f"{best['text'].strip()} mm²",
+                })
 
-        for s in content_spans:
-            t = s["text"].strip()
-            # Index component tags
-            if re.match(r"^(-?[A-Z]{1,4}\d+(?:-\d+)?|FR\d+|HL\d+|SQ(?:-1|\d+)?)$", t):
-                norm_tag = t if t.startswith("-") or t.startswith("HL") or t.startswith("FR") or t.startswith("SQ") else f"-{t}"
-                role = "contact_or_symbol"
-                if pinfo.page_num in (1, 2, 3, 4):
-                    role = "main_circuit"
-                elif pinfo.page_num in (16, 17, 18):
-                    role = "instrument_module"
-                tag_evidences.setdefault(norm_tag, []).append(
-                    EvidenceLocation(
-                        page=pinfo.page_num,
-                        bbox=s["bbox"],
-                        norm_bbox=_expand_norm_bbox(s["norm_bbox"], 0.025, 0.025),
-                        raw_text=t,
-                        role=role,
-                    )
-                )
+    # ---- 2. Terminal strips: pins + wire label above each pin ----
+    strips: Dict[str, Dict[str, Any]] = {}
+    for pinfo in pages_info:
+        if pinfo.page_type != PageType.TERMINAL_DIAGRAM.value:
+            continue
+        spans = page_spans_map.get(pinfo.page_num, [])
+        for hdr in spans:
+            htxt = hdr["text"].strip()
+            if not re.match(r"^(?:=\+?-|-)?X\d+$", htxt, re.IGNORECASE):
+                continue
+            name = "-" + re.search(r"X\d+", htxt.upper()).group(0)
+            row = sorted(
+                [o for o in spans
+                 if o["text"].strip().isdigit() and 1 <= int(o["text"].strip()) <= 200
+                 and -4.0 <= o["cy"] - hdr["cy"] <= 22.0 and o["cx"] > hdr["cx"]],
+                key=lambda o: o["cx"],
+            )
+            pins: List[Dict[str, Any]] = []
+            last_x = hdr["cx"]
+            for o in row:
+                if o["cx"] - last_x > 30.0:  # gap -> next strip on the same row
+                    break
+                pins.append(o)
+                last_x = o["cx"]
+            if not pins:
+                continue
+            pin_info = []
+            for p in pins:
+                label = None
+                best_dy = 50.0
+                for o in spans:
+                    if o is p or o in pins:
+                        continue
+                    dy = p["cy"] - o["cy"]
+                    if abs(o["cx"] - p["cx"]) <= 4.5 and 0 < dy <= best_dy:
+                        best_dy, label = dy, o["text"].strip()
+                pin_info.append({"pin": int(p["text"].strip()), "label": label})
+            nbs = [hdr["norm_bbox"]] + [p["norm_bbox"] for p in pins]
+            strips[name] = {
+                "page": pinfo.page_num, "raw_header": htxt, "bbox": hdr["bbox"], "pins": pin_info,
+                "norm_bbox": [round(min(b[0] for b in nbs), 4), round(max(0.0, min(b[1] for b in nbs) - 0.06), 4),
+                              round(max(b[2] for b in nbs), 4), round(min(1.0, max(b[3] for b in nbs) + 0.06), 4)],
+            }
 
-        # Check for vector-rendered text / pure graphic regions
-        v_res = vision.analyze_vector_regions_on_page(page, spans)
-        vector_findings.extend(v_res)
+    # ---- 3. Resolve label -> gauge via main-circuit label positions ----
+    label_gauge_cache: Dict[str, Optional[str]] = {}
 
-    # For any new unknown schematic PDF that does not match the C26368 dual-45kW star-delta pump template,
-    # run the general-purpose spatial tag-to-model clusterer + cross-page deduplicator:
-    if not ("-QF0" in tag_evidences and "-KM1-1" in tag_evidences and "-LI1" in tag_evidences):
-        return extract_generic_schematic_components(doc, pages_info, page_spans_map, tag_evidences, rules_config)
+    def _gauge_for_label(label: Optional[str]) -> Optional[str]:
+        if not label or label.upper() == "PE":
+            return None
+        if label in label_gauge_cache:
+            return label_gauge_cache[label]
+        best_g, best_score = None, 1e9
+        for pinfo in pages_info:
+            if pinfo.page_type != PageType.MAIN_CIRCUIT.value:
+                continue
+            for s in page_spans_map.get(pinfo.page_num, []):
+                if s["text"].strip() != label:
+                    continue
+                for gm in gauge_marks:
+                    if gm["page"] != pinfo.page_num:
+                        continue
+                    gx0, gy0, gx1, gy1 = gm["bbox"]
+                    gcy = (gy0 + gy1) / 2.0
+                    if gx0 - 6.0 <= s["cx"] <= gx1 + 6.0 and abs(gcy - s["cy"]) <= 90.0:
+                        score = abs(gcy - s["cy"])  # same column
+                    else:
+                        d = math.hypot((gx0 + gx1) / 2.0 - s["cx"], gcy - s["cy"])
+                        score = d + 1000.0 if d <= 120.0 else 1e9
+                    if score < best_score:
+                        best_score, best_g = score, gm["gauge"]
+        label_gauge_cache[label] = best_g
+        return best_g
 
-    # Helper to get evidences for a list of tags
-    def get_evidences_for_tags(tags: List[str], default_page: int = 1) -> Tuple[int, List[float], str, List[EvidenceLocation]]:
-        evs: List[EvidenceLocation] = []
-        for tg in tags:
-            if tg in tag_evidences:
-                evs.extend(tag_evidences[tg])
-            elif tg.lstrip("-") in tag_evidences:
-                evs.extend(tag_evidences[tg.lstrip("-")])
-            elif f"-{tg.lstrip('-')}" in tag_evidences:
-                evs.extend(tag_evidences[f"-{tg.lstrip('-')}"])
-        if not evs:
-            return default_page, [0.1, 0.1, 0.25, 0.25], f"第{default_page}页", []
-        primary = evs[0]
-        pages_sorted = sorted({e.page for e in evs})
-        page_label = ", ".join(f"第{p}页" for p in pages_sorted[:4])
-        if len(pages_sorted) > 4:
-            page_label += f" 等({len(pages_sorted)}页)"
-        return primary.page, primary.norm_bbox, page_label, evs
+    pin_gauge_counts: Dict[Optional[str], int] = {}
+    conductors_by_gauge: Dict[str, set] = {}
+    total_pins = 0
+    control_pins = 0
+    for sname, st in strips.items():
+        prev_g: Optional[str] = None
+        for pi in st["pins"]:
+            total_pins += 1
+            g = _gauge_for_label(pi["label"])
+            if g is None and (pi["label"] or "").upper() == "PE":
+                g = prev_g  # PE pin follows the power group it sits in
+            if g is None:
+                control_pins += 1
+            else:
+                if pi["label"] and pi["label"].upper() != "PE":
+                    conductors_by_gauge.setdefault(g, set()).add(pi["label"])
+            pin_gauge_counts[g] = pin_gauge_counts.get(g, 0) + 1
+            prev_g = g
 
-    raw_items: List[BOMItem] = []
-    review_items: List[ReviewItem] = []
-    seq = 0
+    # ---- 4. Cabinet size for wire run length ----
+    cab = list(default_cab)
+    cab_from_drawing = False
+    for vf in vector_findings or []:
+        if vf.get("type") == "CABINET_DIMENSION":
+            nums = [int(n) for n in re.findall(r"\d{3,4}", str(vf.get("model", "")))]
+            if len(nums) >= 2:
+                cab = nums[:3] + list(default_cab)[len(nums[:3]):]
+                cab_from_drawing = True
+                break
+    per_run_m = (cab[0] + cab[1]) / 1000.0 * route_factor
+    cab_note = f"柜体 {cab[0]}×{cab[1]}mm{'(图纸识别)' if cab_from_drawing else '(配置默认值)'}"
 
-    def add_item(
-        tag: str,
-        tags: List[str],
-        brand: str,
-        name: str,
-        model: str,
-        raw_model: str,
-        unit: str,
-        quantity: float,
-        default_page: int,
-        source_type: str = SourceType.EXPLICIT.value,
-        category: str = "primary",
-        remark: str = "",
-        override_bbox: Optional[List[float]] = None,
-        needs_review: bool = False,
-        review_note: str = "",
-    ) -> BOMItem:
-        nonlocal seq
+    # ---- 5. Wire items ----
+    gauges_found = sorted({gm["gauge"] for gm in gauge_marks}, key=_gv, reverse=True)
+    for g in gauges_found:
+        evs_g = [EvidenceLocation(page=gm["page"], bbox=gm["bbox"], norm_bbox=gm["norm_bbox"],
+                                  raw_text=gm["raw"], role="wire_gauge") for gm in gauge_marks if gm["gauge"] == g]
+        mapped = len(conductors_by_gauge.get(g, set()))
+        n_cond = mapped if mapped > 0 else len(evs_g) * conductors_per_annotation
+        meters = math.ceil(n_cond * per_run_m * (1.0 + wire_spare))
+        basis = (f"端子图关联到 {mapped} 根 {g} 导线" if mapped
+                 else f"图纸 {len(evs_g)} 处 {g} 标注 × 每处 {conductors_per_annotation} 根")
         seq += 1
-        p_page, p_bbox, p_label, evs = get_evidences_for_tags(tags, default_page)
-        if override_bbox is not None:
-            p_bbox = override_bbox
-            if not evs:
-                evs = [
-                    EvidenceLocation(
-                        page=default_page,
-                        bbox=[0.0, 0.0, 100.0, 100.0],
-                        norm_bbox=override_bbox,
-                        raw_text=f"{tag} {model}",
-                        role="main",
-                    )
-                ]
-        item = BOMItem(
-            id=f"item_{seq}",
-            seq_no=seq,
-            tag=tag,
-            tags=tags,
-            placement="",
-            name=name,
-            model=model,
-            raw_model=raw_model,
-            brand=brand,
-            unit=unit,
-            quantity=quantity,
-            remark=remark,
-            pdf_page_label=p_label,
-            primary_page=p_page,
-            primary_bbox=p_bbox,
-            evidences=evs,
-            source_type=source_type,
-            category=category,
-            needs_review=needs_review,
-            review_note=review_note,
-        )
-        raw_items.append(item)
-        return item
+        items.append(BOMItem(
+            id=f"wire_{seq}", seq_no=seq, tag=f"W-{g}", tags=[f"W-{g}"], placement="",
+            name="导线", model=g, raw_model=g, brand=wire_brand, unit="米", quantity=float(meters),
+            remark=f"估算：{basis} × {per_run_m:.2f}m/根 × (1+{wire_spare:.0%})",
+            pdf_page_label=", ".join(f"第{p}页" for p in sorted({e.page for e in evs_g})),
+            primary_page=evs_g[0].page, primary_bbox=evs_g[0].norm_bbox, evidences=evs_g,
+            source_type=SourceType.ESTIMATED_AUX.value, category="auxiliary", needs_review=True,
+            review_note=f"线径为图纸明文；米数为工程估算（{cab_note}），请工程师确认",
+        ))
 
-    # --- Page 1: Main Breakers, Star-Delta Contactors, Thermal Relays ---
-    # 1. -QF0: EZD250M 3P 250A -> EZD250M3250N+ EZDFASB2 (1)
-    add_item(
-        tag="-QF0",
-        tags=["-QF0"],
-        brand="施耐德",
-        name="断路器",
-        model="EZD250M3250N+ EZDFASB2",
-        raw_model="EZD250M 3P 250A",
-        unit="个",
-        quantity=1,
-        default_page=1,
-        source_type=SourceType.EXPLICIT.value,
-    )
+    ctrl_pages = [p.page_num for p in pages_info if p.page_type == PageType.CONTROL_CIRCUIT.value]
+    if ctrl_pages and control_gauge not in gauges_found:
+        n_cond = control_pins + int(control_device_count * control_runs_per_device)
+        if n_cond > 0:
+            meters = math.ceil(n_cond * per_run_m * (1.0 + wire_spare))
+            nb = [0.10, 0.15, 0.85, 0.75]
+            seq += 1
+            items.append(BOMItem(
+                id=f"wire_{seq}", seq_no=seq, tag=f"W-{control_gauge}", tags=[f"W-{control_gauge}"], placement="",
+                name="导线", model=control_gauge, raw_model=control_gauge, brand=wire_brand, unit="米",
+                quantity=float(meters),
+                remark=(f"估算：({control_pins} 个控制端子 + {control_device_count} 个控制元件×{control_runs_per_device:g}) "
+                        f"× {per_run_m:.2f}m × (1+{wire_spare:.0%})"),
+                pdf_page_label=f"第{ctrl_pages[0]}~{ctrl_pages[-1]}页", primary_page=ctrl_pages[0], primary_bbox=nb,
+                evidences=[EvidenceLocation(page=ctrl_pages[0], bbox=[0, 0, 100, 100], norm_bbox=nb,
+                                            raw_text=f"控制回路 {control_gauge}", role="control_wire_estimate")],
+                source_type=SourceType.ESTIMATED_AUX.value, category="auxiliary", needs_review=True,
+                review_note=f"控制回路图纸未标线径，按配置 {control_gauge} 估算（{cab_note}），请工程师确认",
+            ))
 
-    # 2. -QF1, -QF2: EZD160M 3P 125A -> EZD160M3125N+ EZDFASB2 (2)
-    add_item(
-        tag="-QF1, -QF2",
-        tags=["-QF1", "-QF2"],
-        brand="施耐德",
-        name="断路器",
-        model="EZD160M3125N+ EZDFASB2",
-        raw_model="EZD160M 3P 125A",
-        unit="个",
-        quantity=2,
-        default_page=1,
-        source_type=SourceType.EXPLICIT.value,
-    )
+    # ---- 6. Terminal items grouped by rating ----
+    by_rating: Dict[str, Dict[str, Any]] = {}
 
-    # 3. -KM1, -KM1-2, -KM2, -KM2-2: LC1D50M7C (4)
-    km50_item = add_item(
-        tag="-KM1, -KM1-2, -KM2, -KM2-2",
-        tags=["-KM1", "-KM1-2", "-KM2", "-KM2-2"],
-        brand="施耐德",
-        name="交流接触器",
-        model="LC1D50M7C",
-        raw_model="LC1D50M7C",
-        unit="个",
-        quantity=4,
-        default_page=1,
-        source_type=SourceType.TOPOLOGY_INFERRED.value,
-        review_note="1#/2# 45KW 主泵星三角启动主接触器(-KM1,-KM2)与三角形接触器(-KM1-2,-KM2-2)对称回路推导合并，并与第5、14页线圈/触点去重",
-    )
+    def _add_rating(rating: str, count: int, evs: List[EvidenceLocation], basis: str) -> None:
+        slot = by_rating.setdefault(rating, {"count": 0, "evs": [], "basis": []})
+        slot["count"] += count
+        slot["evs"].extend(evs)
+        slot["basis"].append(basis)
 
-    # 4. -KM1-1, -KM2-1: LC1D32M7C (2)
-    km32_item = add_item(
-        tag="-KM1-1, -KM2-1",
-        tags=["-KM1-1", "-KM2-1"],
-        brand="施耐德",
-        name="交流接触器",
-        model="LC1D32M7C",
-        raw_model="LC1D32M7C",
-        unit="个",
-        quantity=2,
-        default_page=1,
-        source_type=SourceType.TOPOLOGY_INFERRED.value,
-        review_note="1#/2# 45KW 主泵星三角启动星形接触器(-KM1-1,-KM2-1)对称回路推导合并，并与第5页线圈/触点去重",
-    )
+    strip_evs = [EvidenceLocation(page=st["page"], bbox=st["bbox"], norm_bbox=st["norm_bbox"],
+                                  raw_text=f"{st['raw_header']} ({len(st['pins'])}位)", role="terminal_diagram_strip")
+                 for st in strips.values()]
+    for g, cnt in pin_gauge_counts.items():
+        if g is None:
+            _add_rating(control_rating, cnt, strip_evs, f"{cnt} 个控制/信号端子位")
+        else:
+            rating = rating_map.get(g.replace("mm²", ""), control_rating)
+            gevs = [EvidenceLocation(page=gm["page"], bbox=gm["bbox"], norm_bbox=gm["norm_bbox"],
+                                     raw_text=gm["raw"], role="wire_gauge") for gm in gauge_marks if gm["gauge"] == g][:2]
+            _add_rating(rating, cnt, gevs + strip_evs, f"{cnt} 个接 {g} 的端子位")
 
-    # 5. FR1, FR2: LRD365 (2)
-    add_item(
-        tag="FR1, FR2",
-        tags=["FR1", "FR2", "-FR1", "-FR2"],
-        brand="施耐德",
-        name="热继电器",
-        model="LRD365",
-        raw_model="LRD365",
-        unit="个",
-        quantity=2,
-        default_page=1,
-        source_type=SourceType.TOPOLOGY_INFERRED.value,
-        review_note="FR2 与 FR1 同属 45KW 对称主泵支路，继承型号 LRD365，已与第5、14页热继触点去重",
-    )
+    if incoming_poles > 0 and gauges_found:
+        top_g = gauges_found[0]
+        if top_g not in conductors_by_gauge:  # largest gauge never lands on a drawn terminal -> incoming feeder
+            rating = rating_map.get(top_g.replace("mm²", ""), control_rating)
+            gevs = [EvidenceLocation(page=gm["page"], bbox=gm["bbox"], norm_bbox=gm["norm_bbox"],
+                                     raw_text=gm["raw"], role="wire_gauge") for gm in gauge_marks if gm["gauge"] == top_g]
+            _add_rating(rating, incoming_poles, gevs, f"进线 {top_g} 未画端子，按配置配 {incoming_poles} 极进线端子")
 
-    review_items.append(
-        ReviewItem(
-            id="rev_sym_star_delta",
-            severity="INFO",
-            issue_type="SYMMETRIC_INFERRED",
-            tag="-KM1~-KM2-2, FR1~FR2",
-            title="对称星三角回路推导：2#主泵电机(45KW)支路继承 1#主泵电机接触器与热继型号",
-            description=(
-                "第 1 页主电路中，仅左侧 1#主泵电机(45KW)标注了 `-KM1 (LC1D50M7C)`、`-KM1-1 (LC1D32M7C)`、`FR1 (LRD365)`，"
-                "而同回路三角形接触器 `-KM1-2` 及右侧完全对称的 2#主泵电机(45KW)支路 (`-KM2, -KM2-2, -KM2-1, FR2`) 省略了型号标注。"
-                "结合第 5 页控制回路（`-KM1-1/KM2-1 Y型`、`-KM1-2/KM2-2 △型`），系统已按星三角拓扑推导：`LC1D50M7C` 共 4 个、`LC1D32M7C` 共 2 个、`LRD365` 共 2 个，并跨页合并了第 5、14 页的线圈与辅助触点。"
-            ),
-            suggestion="系统已自动按物理器件数量完成归并，点击可高亮查看第 1 页与第 5 页对应位置。",
-            page=1,
-            norm_bbox=km50_item.primary_bbox,
-            related_page=5,
-            related_norm_bbox=[0.28, 0.58, 0.96, 0.78],
-            status="PENDING",
-            action_type="CONFIRM",
-        )
-    )
+    def _rating_val(r: str) -> float:
+        m = re.match(r"(\d+(?:\.\d+)?)", r)
+        return float(m.group(1)) if m else 0.0
 
-    # --- Page 2: Auxiliary Motors & Heaters ---
-    # Check if -FR3, -FR4, -FR5 auxiliary contacts are used in control circuits (Pages 6 & 14)
-    has_fr3_aux = "-FR3" in tag_evidences
-    has_fr4_aux = "-FR4" in tag_evidences
-    has_fr5_aux = "-FR5" in tag_evidences
+    for rating in sorted(by_rating.keys(), key=_rating_val, reverse=True):
+        slot = by_rating[rating]
+        qty = math.ceil(slot["count"] * (1.0 + term_spare))
+        evs = slot["evs"] or strip_evs
+        if not evs:
+            continue
+        seq += 1
+        items.append(BOMItem(
+            id=f"term_{seq}", seq_no=seq, tag=f"X-{rating}", tags=[f"X-{rating}"], placement="",
+            name="端子", model=rating, raw_model=rating, brand=terminal_brand, unit="个", quantity=float(qty),
+            remark="；".join(slot["basis"]) + (f"；含 {term_spare:.0%} 备用" if term_spare else ""),
+            pdf_page_label=", ".join(f"第{p}页" for p in sorted({e.page for e in evs})),
+            primary_page=evs[0].page, primary_bbox=evs[0].norm_bbox, evidences=evs,
+            source_type=SourceType.ESTIMATED_AUX.value, category="auxiliary", needs_review=True,
+            review_note="端子位数取自端子图，额定电流按线径→端子规格配置映射，请工程师确认",
+        ))
 
-    # 6. -QF3: GV2ME16C+GVAE11 (1)
-    add_item(
-        tag="-QF3",
-        tags=["-QF3", "-FR3"],
-        brand="施耐德",
-        name="马达保护断路器",
-        model="GV2ME16C+GVAE11" if has_fr3_aux else "GV2ME16C",
-        raw_model="GV2ME16C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.RULE_COMPLETED.value if has_fr3_aux else SourceType.EXPLICIT.value,
-        review_note="第6、14页控制回路使用了辅助触点 -FR3，自动追加辅助触点模块 +GVAE11",
-    )
+    if strips or gauge_marks:
+        strip_summary = "、".join(f"{st['raw_header']}({len(st['pins'])}位)" for st in strips.values()) or "未检出端子图"
+        first_ev = (strip_evs or [EvidenceLocation(page=gauge_marks[0]["page"], bbox=gauge_marks[0]["bbox"],
+                                                   norm_bbox=gauge_marks[0]["norm_bbox"], raw_text="", role="")])[0]
+        reviews.append(ReviewItem(
+            id="rev_wires_terminals_summary", severity="INFO", issue_type="RULE_APPLIED",
+            tag="端子 / 导线",
+            title=f"端子与导线估算：{len(gauges_found)} 种明文线径，端子图共 {total_pins} 位（控制位 {control_pins}）",
+            description=(f"线径 {gauges_found}；端子排 {strip_summary}。端子规格与导线米数为按 rules_config.json "
+                         f"`wire_terminal_estimation` 的工程估算，非图纸明文。"),
+            suggestion="请工程师核对端子规格映射与米数估算，可在【选型规则库】调整系数。",
+            page=first_ev.page, norm_bbox=first_ev.norm_bbox, status="PENDING", action_type="CONFIRM",
+        ))
 
-    # 7. -KM3: LC1D18M7C (1)
-    add_item(
-        tag="-KM3",
-        tags=["-KM3"],
-        brand="施耐德",
-        name="交流接触器",
-        model="LC1D18M7C",
-        raw_model="LC1D18M7C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 8. -QF4: GV2ME10C+GVAE11 (1)
-    add_item(
-        tag="-QF4",
-        tags=["-QF4", "-FR4"],
-        brand="施耐德",
-        name="马达保护断路器",
-        model="GV2ME10C+GVAE11" if has_fr4_aux else "GV2ME10C",
-        raw_model="GV2ME10C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.RULE_COMPLETED.value if has_fr4_aux else SourceType.EXPLICIT.value,
-        review_note="第6、14页控制回路使用了辅助触点 -FR4，自动追加辅助触点模块 +GVAE11",
-    )
-
-    # 9. -KM4: LC1D09M7C (1)
-    add_item(
-        tag="-KM4",
-        tags=["-KM4"],
-        brand="施耐德",
-        name="交流接触器",
-        model="LC1D09M7C",
-        raw_model="LC1D09M7C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 10. -QF5: GV2ME20C+GVAE11 (1)
-    add_item(
-        tag="-QF5",
-        tags=["-QF5", "-FR5"],
-        brand="施耐德",
-        name="马达保护断路器",
-        model="GV2ME20C+GVAE11" if has_fr5_aux else "GV2ME20C",
-        raw_model="GV2ME20C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.RULE_COMPLETED.value if has_fr5_aux else SourceType.EXPLICIT.value,
-        review_note="第6、14页控制回路使用了辅助触点 -FR5，自动追加辅助触点模块 +GVAE11",
-    )
-
-    # 11. -KM5: LC1D25M7C (1)
-    add_item(
-        tag="-KM5",
-        tags=["-KM5"],
-        brand="施耐德",
-        name="交流接触器",
-        model="LC1D25M7C",
-        raw_model="LC1D25M7C",
-        unit="个",
-        quantity=1,
-        default_page=2,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # --- Page 3: Power Supply & Control Breakers ---
-    # 12. -QF10: IC65N 2P C4 (1)
-    add_item(
-        tag="-QF10",
-        tags=["-QF10"],
-        brand="施耐德",
-        name="断路器",
-        model="IC65N 2P C4",
-        raw_model="IC65N 2P C4A",
-        unit="个",
-        quantity=1,
-        default_page=3,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 13. -V1: HDR-150-24 (1)
-    add_item(
-        tag="-V1",
-        tags=["-V1"],
-        brand="MW",
-        name="开关电源",
-        model="HDR-150-24",
-        raw_model="HDR-150-24",
-        unit="个",
-        quantity=1,
-        default_page=3,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 14. -QF15: IC65N 1P C6 (1)
-    add_item(
-        tag="-QF15",
-        tags=["-QF15"],
-        brand="施耐德",
-        name="断路器",
-        model="IC65N 1P C6",
-        raw_model="IC65N 1P C6A",
-        unit="个",
-        quantity=1,
-        default_page=3,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 15. HL0: 白色指示灯 XB2BVB1LC (1)
-    add_item(
-        tag="HL0",
-        tags=["HL0"],
-        brand="施耐德",
-        name="白色指示灯",
-        model="XB2BVB1LC",
-        raw_model="24V 白",
-        unit="个",
-        quantity=1,
-        default_page=3,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="原图标注 HL0 24V 白，按施耐德 XB2 系列标准规则映射为 XB2BVB1LC",
-    )
-
-    # --- Page 4: Fan Breaker & Cabinet Fan ---
-    # 16. -QF17: IC65N 1P C2 (1)
-    add_item(
-        tag="-QF17",
-        tags=["-QF17"],
-        brand="施耐德",
-        name="断路器",
-        model="IC65N 1P C2",
-        raw_model="iC65N-C2A/1P",
-        unit="个",
-        quantity=1,
-        default_page=4,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    # 17. -FAN1 (M7): 风扇+过滤网 223*223 (2)
-    add_item(
-        tag="-FAN1 (M7)",
-        tags=["-FAN1"],
-        brand="优质国产",
-        name="风扇+过滤网",
-        model="223*223",
-        raw_model="柜内风扇",
-        unit="个",
-        quantity=2,
-        default_page=4,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="柜内风扇按一进一出标准配置风扇+过滤网 223*223 (2个)",
-    )
-
-    # --- Page 7, 8, 11, 13, 14, 15: Buttons, Switches, Buzzer, Indicator Lights, Relays ---
-    # 18. -ES1: 急停按钮 XB2BS542C (1)
-    add_item(
-        tag="-ES1",
-        tags=["-ES1"],
-        brand="施耐德",
-        name="急停按钮",
-        model="XB2BS542C",
-        raw_model="急停按钮",
-        unit="个",
-        quantity=1,
-        default_page=7,
-        source_type=SourceType.RULE_COMPLETED.value,
-    )
-
-    # 19. -SB1~-SB4: 启动按钮 XB2BA31C (4)
-    add_item(
-        tag="-SB1, -SB2, -SB3, -SB4",
-        tags=["-SB1", "-SB2", "-SB3", "-SB4"],
-        brand="施耐德",
-        name="启动按钮",
-        model="XB2BA31C",
-        raw_model="-SB1~-SB4",
-        unit="个",
-        quantity=4,
-        default_page=7,
-        source_type=SourceType.RULE_COMPLETED.value,
-    )
-
-    # 20. -SA5, -SA6, -SA7, -SA8(P7): 旋转开关 XB2BD21C (5)
-    sa2_item = add_item(
-        tag="-SA5, -SA6, -SA7, -SA8",
-        tags=["-SA5", "-SA6", "-SA7", "-SA8"],
-        brand="施耐德",
-        name="旋转开关",
-        model="XB2BD21C",
-        raw_model="XB2BD21C",
-        unit="个",
-        quantity=5,
-        default_page=7,
-        source_type=SourceType.EXPLICIT.value,
-        needs_review=True,
-        review_note="第7页4处二位旋钮(XB2BD21C) + 第11页1处蜂鸣器旋钮(-SA7) = 5个；注意位号 -SA8 在第7页标为 XB2BD21C，在第8页标为 XB2BD31C",
-    )
-
-    # 21. -SA8(P8), -SA9, -SA10: 旋转开关 XB2BD31C (3)
-    sa3_item = add_item(
-        tag="-SA8, -SA9, -SA10",
-        tags=["-SA9", "-SA10", "-SA8"],
-        brand="施耐德",
-        name="旋转开关",
-        model="XB2BD31C",
-        raw_model="XB2BD31C",
-        unit="个",
-        quantity=3,
-        default_page=8,
-        source_type=SourceType.EXPLICIT.value,
-    )
-
-    review_items.append(
-        ReviewItem(
-            id="rev_conflict_sa8",
-            severity="CONFLICT",
-            issue_type="PARAM_MISMATCH",
-            tag="-SA8",
-            title="位号冲突：[-SA8] 在第 7 页标注为二位旋钮 `XB2BD21C`，在第 8 页标注为三位旋钮 `XB2BD31C`",
-            description=(
-                "第 7 页上方两处触点 `-SA8` 下方明确标注型号为 `XB2BD21C`（二位选择开关），"
-                "而第 8 页左侧电磁溢流阀切换开关 `-SA8` 下方标注型号为 `XB2BD31C`（三位选择开关）。"
-                "按图纸符号统计：`XB2BD21C` 计 5 个（含第 7 页 4 处 + 第 11 页 `-SA7`），`XB2BD31C` 计 3 个（第 8 页 `-SA8, -SA9, -SA10`）。"
-            ),
-            suggestion="请核实第 7 页两处 `-SA8` 是否为 `-SA8`（三位旋钮）的常开触点对或是独立旋钮，可在右侧表格直接调整数量。",
-            page=7,
-            norm_bbox=sa2_item.primary_bbox,
-            related_page=8,
-            related_norm_bbox=sa3_item.primary_bbox,
-            status="PENDING",
-            action_type="CONFIRM",
-        )
-    )
-
-    # 22. -BZ1: 蜂鸣器 XB2BSB4LC (1)
-    add_item(
-        tag="-BZ1",
-        tags=["-BZ1"],
-        brand="施耐德",
-        name="蜂鸣器",
-        model="XB2BSB4LC",
-        raw_model="蜂鸣器",
-        unit="个",
-        quantity=1,
-        default_page=11,
-        source_type=SourceType.RULE_COMPLETED.value,
-    )
-
-    # 23. HL19~HL23: 绿色指示灯 XB2BVM3LC (5)
-    add_item(
-        tag="HL19, HL20, HL21, HL22, HL23",
-        tags=["HL21", "HL22", "HL23", "HL19", "HL20"],
-        brand="施耐德",
-        name="绿色指示灯",
-        model="XB2BVM3LC",
-        raw_model="绿",
-        unit="个",
-        quantity=5,
-        default_page=7,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="跨页汇总：第7页(HL21~HL23, 3个) + 第14页(HL19~HL20, 2个) = 5个，按施耐德 XB2 系列映射为 XB2BVM3LC",
-    )
-
-    # 24. HL7~HL13: 红色指示灯 XB2BVM4LC (7)
-    add_item(
-        tag="HL7~HL13",
-        tags=["HL12", "HL13", "HL7", "HL8", "HL9", "HL10", "HL11"],
-        brand="施耐德",
-        name="红色指示灯",
-        model="XB2BVM4LC",
-        raw_model="红",
-        unit="个",
-        quantity=7,
-        default_page=13,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="跨页汇总：第13页(HL12~HL13, 2个) + 第14页(HL7~HL11, 5个) = 7个，按施耐德 XB2 系列映射为 XB2BVM4LC",
-    )
-
-    # 25. HL1~HL6, HL14~HL18: 黄色指示灯 XB2BVM5LC (11)
-    add_item(
-        tag="HL1~HL6, HL14~HL18",
-        tags=["HL14", "HL15", "HL16", "HL17", "HL18", "HL1", "HL2", "HL3", "HL4", "HL5", "HL6"],
-        brand="施耐德",
-        name="黄色指示灯",
-        model="XB2BVM5LC",
-        raw_model="黄",
-        unit="个",
-        quantity=11,
-        default_page=13,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="跨页汇总：第13页(HL14~HL18, 5个) + 第15页(HL1~HL6, 6个) = 11个，按施耐德 XB2 系列映射为 XB2BVM5LC",
-    )
-
-    # 26. -KA*: 中间继电器 RXM2LB2BD+RXZE1M2C (30)
-    ka_tags = sorted(
-        [t for t in tag_evidences.keys() if t.startswith("-KA")],
-        key=lambda x: int(re.sub(r"\D", "", x) or "0"),
-    )
-    add_item(
-        tag=", ".join(ka_tags[:6]) + f" 等({len(ka_tags)}组位号)",
-        tags=ka_tags,
-        brand="施耐德",
-        name="中间继电器",
-        model="RXM2LB2BD+RXZE1M2C",
-        raw_model="-KA*",
-        unit="个",
-        quantity=30,
-        default_page=7,
-        source_type=SourceType.RULE_COMPLETED.value,
-        review_note="跨页去重统计第7、8、9、10、16、17、18页中间继电器线圈（触点不重复计数），标准配施耐德 RXM2LB2BD+RXZE1M2C",
-    )
-
-    # 27. -LI1, -TI1, -PI1, -PI2, -FI1: 虹润 液位继电器 NHR-1100C-27-X/2/P-A (5)
-    add_item(
-        tag="-LI1, -TI1, -PI1, -PI2, -FI1",
-        tags=["-LI1", "-TI1", "-PI1", "-PI2", "-FI1"],
-        brand="虹润",
-        name="液位继电器",
-        model="NHR-1100C-27-X/2/P-A",
-        raw_model="NHR-1100C-27-X/2/P-A",
-        unit="个",
-        quantity=5,
-        default_page=16,
-        source_type=SourceType.EXPLICIT.value,
-        review_note="第16~18页 5 台 NHR-1100C-27-X/2/P-A 智能仪表（已与第3页供电框图去重）",
-    )
-
-    # 28. Page 20 Cabinet Layout (from Vision / Vector Recognizer)
-    cab_finding = next((f for f in vector_findings if f["type"] == "CABINET_DIMENSION"), None)
-    cab_page = cab_finding["page"] if cab_finding else 20
-    cab_model = cab_finding["model"] if cab_finding else "1550*900*300mm"
-    cab_bbox = cab_finding["norm_bbox"] if cab_finding else [0.05, 0.05, 0.95, 0.92]
-    add_item(
-        tag="-CABINET",
-        tags=["-CABINET"],
-        brand="XSH",
-        name="仿威图电柜",
-        model=cab_model,
-        raw_model=cab_model,
-        unit="个",
-        quantity=1,
-        default_page=cab_page,
-        source_type=SourceType.EXPLICIT.value,
-        category="auxiliary",
-        override_bbox=cab_bbox,
-        review_note="第20页纯CAD矢量柜体结构图视觉切片识别：高1550*宽900*深300mm",
-    )
-
-    # --- Rows 29-38: Engineering Auxiliary Items (Labor, Wires, Terminals) ---
-    aux_cfg = rules_config.get("auxiliary_estimation_rules", {})
-    if aux_cfg.get("enable_for_schematic_mode", True):
-        labor = aux_cfg.get("labor_item", {"brand": "XSH", "name": "人工", "model": "", "unit": "个", "quantity": 1})
-        add_item(
-            tag="-LABOR",
-            tags=[],
-            brand=labor["brand"],
-            name=labor["name"],
-            model=labor["model"],
-            raw_model="",
-            unit=labor["unit"],
-            quantity=labor["quantity"],
-            default_page=20,
-            source_type=SourceType.ESTIMATED_AUX.value,
-            category="auxiliary",
-            override_bbox=[0.05, 0.88, 0.95, 0.96],
-        )
-
-        for w_item in aux_cfg.get("wire_defaults", []):
-            w_page = 1 if w_item["model"] in ("70mm²", "16mm²") else 2
-            add_item(
-                tag=f"-WIRE({w_item['model']})",
-                tags=[],
-                brand=w_item["brand"],
-                name=w_item["name"],
-                model=w_item["model"],
-                raw_model=w_item["model"],
-                unit=w_item["unit"],
-                quantity=w_item["quantity"],
-                default_page=w_page,
-                source_type=SourceType.ESTIMATED_AUX.value,
-                category="auxiliary",
-                override_bbox=[0.05, 0.15, 0.65, 0.65],
-                review_note=f"依据第1~2页主回路线径标注 ({w_item['model']}) 与标准柜内布线工程量估算",
-            )
-
-        for t_item in aux_cfg.get("terminal_defaults", []):
-            add_item(
-                tag=f"-X({t_item['model']})",
-                tags=["=+-X1", "=+-X2", "=+-X3"],
-                brand=t_item["brand"],
-                name=t_item["name"],
-                model=t_item["model"],
-                raw_model=t_item["model"],
-                unit=t_item["unit"],
-                quantity=t_item["quantity"],
-                default_page=19,
-                source_type=SourceType.ESTIMATED_AUX.value,
-                category="auxiliary",
-                override_bbox=[0.08, 0.12, 0.88, 0.78],
-                review_note="依据第1、2、19页端子排 (-X1:1~30, -X2:1~14, -X3:1~28) 及回路额定电流工程配比统计",
-            )
-
-    # --- Add Vector-Text & Schematic Omission Findings to Review Queue ---
-    for vf in vector_findings:
-        if vf["type"] == "VECTOR_TEXT_MODEL":
-            review_items.append(
-                ReviewItem(
-                    id=f"rev_vector_{vf['page']}_{vf['tag']}",
-                    severity="WARNING",
-                    issue_type="MISSING_IN_PART_LIST",
-                    tag=vf["tag"],
-                    title=f"疑似人工漏项（CAD曲线文字检出）：第 {vf['page']} 页 [{vf['tag']}] 型号 `{vf['model']}`",
-                    description=vf["note"] + " 人工标准 BOM 中未包含该物料，请确认是否需要加入采购清单。",
-                    suggestion=f"点击【采纳并加入 BOM】可将 `{vf['name']} ({vf['model']} × {vf['quantity']})` 自动追加至 BOM 表。",
-                    page=vf["page"],
-                    norm_bbox=vf["norm_bbox"],
-                    status="PENDING",
-                    action_type="ADD_ITEM",
-                    proposed_data={
-                        "tag": vf["tag"],
-                        "brand": vf["brand"],
-                        "name": vf["name"],
-                        "model": vf["model"],
-                        "unit": "个",
-                        "quantity": vf["quantity"],
-                        "remark": f"第{vf['page']}页视觉切片补漏",
-                        "pdf_page_label": f"第{vf['page']}页",
-                    },
-                )
-            )
-
-    # Also check Page 4 door switch SQ and cabinet light
-    if "SQ" in tag_evidences:
-        sq_ev = tag_evidences["SQ"][0]
-        review_items.append(
-            ReviewItem(
-                id="rev_missing_sq_light",
-                severity="WARNING",
-                issue_type="MISSING_IN_PART_LIST",
-                tag="SQ / 柜内照明",
-                title="疑似人工漏项：第 4 页绘制了柜门行程开关 [SQ] 与 [柜内照明]，但未标注具体型号",
-                description=(
-                    "第 4 页风扇与照明回路中绘制了门控行程开关 `SQ / SQ-1` 与 `柜内照明` 灯具符号，"
-                    "但原图未标注具体型号，人工标准 BOM 亦未单列（可能随仿威图电柜成套附带或漏统计）。"
-                ),
-                suggestion="若电柜未自带门控灯，可点击【采纳并加入 BOM】补充柜内照明灯（如 LS-T5YYSS-24W-I）及行程开关。",
-                page=4,
-                norm_bbox=sq_ev.norm_bbox,
-                status="PENDING",
-                action_type="ADD_ITEM",
-                proposed_data={
-                    "tag": "SQ",
-                    "brand": "施耐德/通用",
-                    "name": "柜内照明灯+门行程开关",
-                    "model": "LS-T5YYSS-24W-I",
-                    "unit": "套",
-                    "quantity": 1,
-                    "remark": "第4页柜内照明回路补漏",
-                    "pdf_page_label": "第4页",
-                },
-            )
-        )
-
-    return raw_items, review_items
+    return items, reviews

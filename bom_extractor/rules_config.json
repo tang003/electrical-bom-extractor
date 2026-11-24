@@ -3,14 +3,38 @@
   "description": "工业电控柜 BOM 提取与企业标准选型规则配置库",
   "filter_rules": {
     "exclude_zero_quantity": true,
-    "exclude_remarks_without_valid_model": ["液压站部件"],
-    "valid_model_prefixes_when_hydraulic": ["MEG", "ES680", "RXLG", "MD500"],
+    "exclude_remarks_without_valid_model": [
+      "液压站部件"
+    ],
+    "valid_model_prefixes_when_hydraulic": [
+      "MEG",
+      "ES680",
+      "RXLG",
+      "MD500"
+    ],
     "exclude_placeholder_models": [
       "^DT\\d+$",
-      "^SP\\d+$",
-      "^LF60D-DPAA1S120F675NB$"
+      "^SP\\d+$"
     ],
-    "exclude_field_load_tags": ["-M1", "-M2", "-M3", "-M4", "-R1", "-R2", "-YV1", "-YV2", "-YV3", "-YV4A", "-YV4B", "FP1", "FP2", "FP3", "FP4", "FP5", "FP6"]
+    "exclude_field_load_tags": [
+      "-M1",
+      "-M2",
+      "-M3",
+      "-M4",
+      "-R1",
+      "-R2",
+      "-YV1",
+      "-YV2",
+      "-YV3",
+      "-YV4A",
+      "-YV4B",
+      "FP1",
+      "FP2",
+      "FP3",
+      "FP4",
+      "FP5",
+      "FP6"
+    ]
   },
   "plc_accessory_rules": [
     {
@@ -85,17 +109,53 @@
   "panel_series_rules": {
     "series_name": "施耐德 XB2 / RXM 标准系列",
     "indicator_lights": {
-      "白": {"brand": "施耐德", "name": "白色指示灯", "model": "XB2BVB1LC"},
-      "绿": {"brand": "施耐德", "name": "绿色指示灯", "model": "XB2BVM3LC"},
-      "红": {"brand": "施耐德", "name": "红色指示灯", "model": "XB2BVM4LC"},
-      "黄": {"brand": "施耐德", "name": "黄色指示灯", "model": "XB2BVM5LC"}
+      "白": {
+        "brand": "施耐德",
+        "name": "白色指示灯",
+        "model": "XB2BVB1LC"
+      },
+      "绿": {
+        "brand": "施耐德",
+        "name": "绿色指示灯",
+        "model": "XB2BVM3LC"
+      },
+      "红": {
+        "brand": "施耐德",
+        "name": "红色指示灯",
+        "model": "XB2BVM4LC"
+      },
+      "黄": {
+        "brand": "施耐德",
+        "name": "黄色指示灯",
+        "model": "XB2BVM5LC"
+      }
     },
     "buttons_and_switches": {
-      "emergency_stop": {"brand": "施耐德", "name": "急停按钮", "model": "XB2BS542C"},
-      "push_button": {"brand": "施耐德", "name": "启动按钮", "model": "XB2BA31C"},
-      "selector_2pos": {"brand": "施耐德", "name": "旋转开关", "model": "XB2BD21C"},
-      "selector_3pos": {"brand": "施耐德", "name": "旋转开关", "model": "XB2BD31C"},
-      "buzzer": {"brand": "施耐德", "name": "蜂鸣器", "model": "XB2BSB4LC"}
+      "emergency_stop": {
+        "brand": "施耐德",
+        "name": "急停按钮",
+        "model": "XB2BS542C"
+      },
+      "push_button": {
+        "brand": "施耐德",
+        "name": "启动按钮",
+        "model": "XB2BA31C"
+      },
+      "selector_2pos": {
+        "brand": "施耐德",
+        "name": "旋转开关",
+        "model": "XB2BD21C"
+      },
+      "selector_3pos": {
+        "brand": "施耐德",
+        "name": "旋转开关",
+        "model": "XB2BD31C"
+      },
+      "buzzer": {
+        "brand": "施耐德",
+        "name": "蜂鸣器",
+        "model": "XB2BSB4LC"
+      }
     },
     "intermediate_relay": {
       "brand": "施耐德",
@@ -108,25 +168,53 @@
       "name": "风扇+过滤网",
       "model": "223*223",
       "quantity_per_fan_symbol": 2
-    }
+    },
+    "enable_automatic_series_selection": false
   },
   "auxiliary_estimation_rules": {
     "enable_for_schematic_mode": true,
     "cabinet_default_brand": "XSH",
     "cabinet_default_name": "仿威图电柜",
-    "labor_item": {"brand": "XSH", "name": "人工", "model": "", "unit": "个", "quantity": 1},
-    "wire_defaults": [
-      {"model": "70mm²", "brand": "国产", "name": "导线", "unit": "米", "quantity": 9},
-      {"model": "16mm²", "brand": "国产", "name": "导线", "unit": "米", "quantity": 20},
-      {"model": "4mm²", "brand": "国产", "name": "导线", "unit": "米", "quantity": 20},
-      {"model": "2.5mm²", "brand": "国产", "name": "导线", "unit": "米", "quantity": 20},
-      {"model": "1mm²", "brand": "国产", "name": "导线", "unit": "米", "quantity": 300}
-    ],
-    "terminal_defaults": [
-      {"model": "250A", "brand": "国产", "name": "端子", "unit": "个", "quantity": 5},
-      {"model": "100A", "brand": "国产", "name": "端子", "unit": "个", "quantity": 8},
-      {"model": "25A", "brand": "国产", "name": "端子", "unit": "个", "quantity": 8},
-      {"model": "16A", "brand": "国产", "name": "端子", "unit": "个", "quantity": 75}
+    "labor_item": {
+      "brand": "XSH",
+      "name": "人工",
+      "model": "",
+      "unit": "个",
+      "quantity": 1
+    },
+    "enable_automatic_quantity_estimation": false
+  },
+  "wire_terminal_estimation": {
+    "description": "基于图纸端子图点位与主回路明文线径的动态推导及工程估算参数",
+    "wire_brand": "国产",
+    "terminal_brand": "国产",
+    "gauge_to_terminal_rating": {
+      "70": "250A",
+      "50": "150A",
+      "35": "125A",
+      "25": "100A",
+      "16": "100A",
+      "10": "60A",
+      "6": "40A",
+      "4": "25A",
+      "2.5": "25A",
+      "1.5": "16A",
+      "1": "16A",
+      "0.75": "16A",
+      "0.5": "16A"
+    },
+    "control_terminal_rating": "16A",
+    "control_wire_gauge": "1mm²",
+    "terminal_spare_ratio": 0.05,
+    "wire_spare_ratio": 0.1,
+    "route_factor": 1.0,
+    "conductors_per_unmapped_annotation": 3,
+    "control_runs_per_device": 2.0,
+    "incoming_terminal_poles": 5,
+    "default_cabinet_mm": [
+      1550,
+      900,
+      300
     ]
   }
 }

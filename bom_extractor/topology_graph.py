@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import re
+from statistics import median
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import cv2
@@ -9,10 +10,8 @@ import numpy as np
 import pymupdf
 
 
-TAG_ANCHOR_RE = re.compile(
-    r"^(?:=[A-Z0-9]+\+)?-?(?:QF|QS|KM|KA|KT|KV|KF|FR|FU|FV|FA|FB|FC|FD|F|Q|K|T|TC|TM|TV|TA|VC|U|G|GS|PS|PLC|CPU|M|YV|DT|SP|SB|SA|HL|HG|HR|HY|HA|HB|XT|X|R|EH|C|L|B|PT|TT|LT|FT|YV|SPD)\d*[A-Z0-9.\-]*$",
-    re.IGNORECASE,
-)
+from .notation import COMPONENT_TAG_RE as TAG_ANCHOR_RE, device_code, extract_model_strings, is_connection_tag, with_component_anchors
+from .device_outlines import device_outline_boxes, outline_near_tag
 
 
 class VectorTopologyBuilder:
@@ -42,8 +41,8 @@ class VectorTopologyBuilder:
 
     @classmethod
     def classify_tag_to_yolo_class(cls, tag: str, name: str = "") -> Tuple[int, str]:
-        t = tag.upper().lstrip("=-0123456789+")
-        if t.startswith(("QF", "QS", "Q", "F8", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "FB")):
+        t = device_code(tag)
+        if t in ("QF", "QS", "Q", "F", "FB"):
             return 0, "circuit_breaker"
         if t.startswith(("KM", "KA", "KT", "KV", "K")):
             if "触点" in name:
@@ -55,11 +54,11 @@ class VectorTopologyBuilder:
             return 4, "motor"
         if t.startswith("FU"):
             return 5, "fuse"
-        if t.startswith(("TC", "TM", "TV", "TA", "G", "PS")) or "电源" in name or "变压器" in name:
+        if t.startswith(("TC", "TM", "TV", "TA", "T", "G", "PS")) or "电源" in name or "变压器" in name:
             return 6, "transformer"
         if t.startswith(("PLC", "CPU", "U")) or "PLC" in name or "模块" in name or "控制器" in name:
             return 7, "plc_module"
-        if t.startswith(("SB", "SA", "HL", "HG", "HR", "HA")) or "按钮" in name or "指示灯" in name:
+        if t.startswith(("SB", "SA", "HL", "HG", "HR", "HA", "WL")) or "按钮" in name or "指示灯" in name:
             return 8, "switch_button"
         return 9, "terminal_other"
 
@@ -75,61 +74,73 @@ class VectorTopologyBuilder:
         3. Assign Set-of-Mark IDs (`[#1]`, `[#2]`, ...) and build a `NetworkX` connectivity graph.
         """
         rot_mat = page.rotation_matrix
-        rot_rect = page.rect * rot_mat
-        off_x = float(rot_rect.x0)
-        off_y = float(rot_rect.y0)
-        page_w = abs(float(rot_rect.width)) or 1.0
-        page_h = abs(float(rot_rect.height)) or 1.0
+        spans=with_component_anchors(spans)
+        page_w = float(page.rect.width) or 1.0
+        page_h = float(page.rect.height) or 1.0
 
         drawings = page.get_drawings()
         wires: List[Tuple[float, float, float, float]] = []
         short_rects: List[List[float]] = []
+        mechanical_context=any(re.search(r'开孔|穿线孔|安装孔|钻孔|\bCUTOUT\b|MOUNTING\s+HOLES?',s['text'],re.I) for s in spans)
+        sizes=[s['size'] for s in spans if s.get('size',0)>0]
+        usual_font=median(sizes) if sizes else 0
+        solid_frames=[]
 
         for d in drawings:
             r = d.get("rect")
             if not r:
                 continue
             vr = pymupdf.Rect(r) * rot_mat
-            x0, y0 = float(vr.x0) - off_x, float(vr.y0) - off_y
-            x1, y1 = float(vr.x1) - off_x, float(vr.y1) - off_y
+            x0, y0 = max(0.0, float(vr.x0)), max(0.0, float(vr.y0))
+            x1, y1 = min(page_w, float(vr.x1)), min(page_h, float(vr.y1))
             x0, x1 = min(x0, x1), max(x0, x1)
             y0, y1 = min(y0, y1), max(y0, y1)
             w = x1 - x0
             h = y1 - y0
+            fill=d.get('fill')
+            if (mechanical_context and fill is not None and max(fill)<.25 and d.get('fill_opacity',1)>.9
+                and max(w,h)>.2*min(page_w,page_h) and max(3,usual_font*.8)<min(w,h)<.04*min(page_w,page_h)):
+                solid_frames.append([x0,y0,x1,y1])
 
-            # Ignore full-page border frames
-            if w > page_w * 0.75 or h > page_h * 0.75:
+            # Ignore border frames and title block area at bottom
+            if w > page_w * 0.75 or h > page_h * 0.75 or y0 > page_h * 0.87 or y1 < page_h * 0.03:
                 continue
 
             # Long horizontal or vertical stroke -> routing wire segment
             if (w > 36.0 and h < 3.5) or (h > 36.0 and w < 3.5):
                 wires.append((x0, y0, x1, y1))
-            elif 2.0 <= max(w, h) <= 65.0:
+            elif 2.0 <= max(w, h) <= 55.0:
                 short_rects.append([x0, y0, x1, y1])
 
         # Step 2: Cluster nearby short strokes into symbol bounding boxes
-        symbol_clusters = cls._cluster_boxes(short_rects, dist_thresh=8.0, min_size=8.0, max_size=95.0)
+        symbol_clusters = cls._cluster_boxes(short_rects, dist_thresh=6.0, min_size=6.0, max_size=65.0)
 
         # Step 3: Optional YOLOv11 ONNX detection if custom weights exist
         yolo_boxes = cls._run_yolo_if_available(page, page_w, page_h)
 
-        # Step 4: Anchor around explicit component tags and merge with symbol clusters
+        # Step 4: Anchor around explicit component tags and merge tightly with symbol clusters
+        device_outlines = device_outline_boxes(page)
         candidates: List[Dict[str, Any]] = []
         used_cluster_indices = set()
 
-        for sp in spans:
+        content_spans = [
+            s for s in spans
+            if 0.03 * page_h < s["cy"] < 0.87 * page_h
+            and 0.02 * page_w < s["cx"] < 0.98 * page_w
+        ]
+
+        for sp in content_spans:
             txt = sp["text"].strip()
             if not TAG_ANCHOR_RE.match(txt):
                 continue
-            # Filter pure small numbers or terminal pin numbers
             if txt.isdigit() or len(txt) < 2:
                 continue
             sx0, sy0, sx1, sy1 = sp["bbox"]
             scx, scy = sp["cx"], sp["cy"]
 
-            # Find nearest geometric symbol cluster within 45pt
+            # Find nearest geometric symbol cluster within 36pt
             best_idx = -1
-            best_dist = 45.0
+            best_dist = 36.0
             for idx, cb in enumerate(symbol_clusters):
                 ccx = (cb[0] + cb[2]) / 2.0
                 ccy = (cb[1] + cb[3]) / 2.0
@@ -146,26 +157,54 @@ class VectorTopologyBuilder:
                 ux1 = max(sx1, cb[2]) + 4.0
                 uy1 = max(sy1, cb[3]) + 4.0
             else:
-                ux0, uy0, ux1, uy1 = sx0 - 12.0, sy0 - 12.0, sx1 + 24.0, sy1 + 20.0
+                ux0, uy0, ux1, uy1 = sx0 - 10.0, sy0 - 10.0, sx1 + 16.0, sy1 + 14.0
+
+            # Collect nearby text tokens for semantic context (without inflating the visual box beyond 34pt)
+            nearby_texts = []
+            for other in sorted(content_spans, key=lambda o: math.hypot(o["cx"] - scx, o["cy"] - scy)):
+                d_other = math.hypot(other["cx"] - scx, other["cy"] - scy)
+                ot = other["text"].strip()
+                if d_other <= 48.0:
+                    nearby_texts.append(ot)
+                    # Only expand visual box for tight adjacent model/spec text within 32pt (and not another tag)
+                    if d_other <= 32.0 and not (other is not sp and TAG_ANCHOR_RE.match(ot)):
+                        ux0 = min(ux0, other["bbox"][0] - 2.0)
+                        uy0 = min(uy0, other["bbox"][1] - 2.0)
+                        ux1 = max(ux1, other["bbox"][2] + 2.0)
+                        uy1 = max(uy1, other["bbox"][3] + 2.0)
+                elif (
+                    txt.upper().lstrip("=").startswith(("-LI", "-TI", "-PI", "-FI", "-U", "-PLC", "-CPU"))
+                    and abs(other["cx"] - scx) <= 46.0
+                    and 0 < (other["cy"] - scy) <= 210.0
+                ):
+                    # Large instrument / PLC module block: wrap the entire module housing down to its bottom model string
+                    nearby_texts.append(ot)
+                    ux0 = min(ux0, other["bbox"][0] - 8.0)
+                    uy0 = min(uy0, other["bbox"][1] - 4.0)
+                    ux1 = max(ux1, other["bbox"][2] + 8.0)
+                    uy1 = max(uy1, other["bbox"][3] + 4.0)
+
+            body = outline_near_tag(device_outlines, pymupdf.Rect(sx0, sy0, sx1, sy1))
+            if body is not None:
+                ux0, uy0, ux1, uy1 = body.x0-2.0, body.y0-2.0, body.x1+2.0, body.y1+2.0
 
             ux0 = max(0.0, ux0)
             uy0 = max(0.0, uy0)
             ux1 = min(page_w, ux1)
             uy1 = min(page_h, uy1)
 
-            # Collect all nearby text spans within 68pt radius for context
-            nearby_texts = []
-            for other in spans:
-                if math.hypot(other["cx"] - scx, other["cy"] - scy) <= 68.0:
-                    nearby_texts.append(other["text"].strip())
-                    ux0 = min(ux0, other["bbox"][0])
-                    uy0 = min(uy0, other["bbox"][1])
-                    ux1 = max(ux1, other["bbox"][2])
-                    uy1 = max(uy1, other["bbox"][3])
-
             cls_id, cls_name = cls.classify_tag_to_yolo_class(txt, " ".join(nearby_texts))
+            model_candidates=list(dict.fromkeys(value for token in nearby_texts for value in extract_model_strings(token)))
+            # Keep suspicious mechanical labels inspectable, without presenting them
+            # as normal electrical candidates or using them in a branch chain.
+            font_size=sp.get('size',sy1-sy0)
+            next_to_frame=any(math.hypot(max(r[0]-sx1,sx0-r[2],0),max(r[1]-sy1,sy0-r[3],0))<=max(2,usual_font*.65) for r in solid_frames)
+            connection_label=is_connection_tag(txt)
+            excluded=connection_label or bool(mechanical_context and usual_font and 0<font_size<=min(3,usual_font*.65) and next_to_frame and not model_candidates)
             candidates.append({
-                "tag": txt,
+                "tag": sp.get('native_tag',txt),
+                "anchor_source_text": sp.get('source_text',txt),
+                "unindexed_tag": sp.get('unindexed_tag',False),
                 "yolo_class_id": cls_id,
                 "yolo_class": cls_name,
                 "bbox": [round(ux0, 2), round(uy0, 2), round(ux1, 2), round(uy1, 2)],
@@ -178,22 +217,33 @@ class VectorTopologyBuilder:
                 "cx": round((ux0 + ux1) / 2.0, 2),
                 "cy": round((uy0 + uy1) / 2.0, 2),
                 "nearby_texts": list(dict.fromkeys(nearby_texts)),
+                "model_candidates": model_candidates,
+                "anchor_norm_bbox": [round(sx0/page_w,4),round(sy0/page_h,4),round(sx1/page_w,4),round(sy1/page_h,4)],
+                "anchor_font_size": round(font_size,2),
+                "bbox_source": "vector_device_outline" if body is not None else "tag_and_nearby_geometry",
+                "excluded": excluded,
+                "exclusion_reason": ("跨页连线/电位标识，不是独立采购元件。" if connection_label else
+                                     "开孔/机械图中的微小标注紧贴粗实心边框，暂缺有效电气元件证据。" if excluded else ""),
                 "detector_source": "VECTOR_SYMBOL+TAG_ANCHOR",
             })
 
         # Add any YOLO-detected boxes that weren't covered by tag anchors
         for yb in yolo_boxes:
-            if not cls._overlaps_any(yb["bbox"], candidates):
+            if not cls._overlaps_any(yb["bbox"], [c for c in candidates if not c.get('excluded')]):
                 candidates.append(yb)
 
         # Deduplicate overlapping candidates and sort top-to-bottom, left-to-right
-        candidates = cls._nms_candidates(candidates, iou_thresh=0.45)
+        candidates = (cls._nms_candidates([c for c in candidates if not c.get('excluded')], iou_thresh=0.45)
+                      +cls._nms_candidates([c for c in candidates if c.get('excluded')], iou_thresh=0.45))
         candidates.sort(key=lambda c: (round(c["cx"] / 55.0), c["cy"]))
 
         # Assign Set-of-Mark IDs: [#1], [#2], ...
         for idx, cand in enumerate(candidates, start=1):
             cand["som_id"] = idx
             cand["som_label"] = f"#{idx}"
+
+        excluded_candidates=[c for c in candidates if c.get('excluded')]
+        candidates=[c for c in candidates if not c.get('excluded')]
 
         # Step 5: Build NetworkX wire & functional branch connectivity graph
         graph, branches = cls._build_connectivity_graph(candidates, wires)
@@ -205,6 +255,7 @@ class VectorTopologyBuilder:
             "wire_segment_count": len(wires),
             "symbol_cluster_count": len(symbol_clusters),
             "candidates": candidates,
+            "excluded_candidates": excluded_candidates,
             "branches": branches,
             "edges": [{"from": u, "to": v, "type": d.get("type", "wire")} for u, v, d in graph.edges(data=True)],
         }

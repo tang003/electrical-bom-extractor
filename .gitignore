@@ -10,3 +10,22 @@ output/proj_*/
 output/*/pages_cache/
 dataset/yolo_electrical/images/
 dataset/yolo_electrical/runs/
+
+.env
+.env.*
+*.local.json
+
+tools/cad_converter/bin/
+tools/cad_converter/obj/
+tools/cad_converter/publish/
+
+# Workstation settings and customer drawings stay local.
+bom_extractor/vlm_config.json
+参考文件/
+output/
+outputs/
+tmp/
+deliverables/
+dataset/yolo_electrical/labels/train/
+dataset/yolo_electrical/train.txt
+dataset/yolo_electrical/val.txt
