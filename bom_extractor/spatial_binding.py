@@ -133,6 +133,59 @@ def device_captions(spans, anchors, bodies):
     return owners
 
 
+def stacked_device_annotations(spans, anchors):
+    """Keep the literal lines printed directly below a device tag.
+
+    This is intentionally separate from model/name selection: a function or
+    interface note is useful to an engineer even when it is not a part number.
+    Only a uniquely aligned, contiguous label stack belongs to the device.
+    """
+    owners = {}
+    for anchor in anchors:
+        tag = anchor['tag']
+        if re.search(r'-X\d+[A-Z]?(?::\d+)?$', tag, re.I):
+            continue  # Terminal numbers and PT labels have their own extraction.
+        ax0, ay0, ax1, ay1 = anchor['bbox']
+        height = max(4.0, ay1 - ay0)
+        cutoff = ay1 + 8 * height
+        next_tags = [other['bbox'][1] for other in anchors if other is not anchor
+                     and other['bbox'][1] > ay1
+                     and abs(other['bbox'][0] - ax0) <= height]
+        if next_tags:
+            cutoff = min(cutoff, min(next_tags))
+        aligned = sorted((span for span in spans if span is not anchor
+                          and ay1 - 1 <= span['bbox'][1] < cutoff
+                          and (abs(span['bbox'][0] - ax0) <= height
+                               or abs(span['bbox'][2] - ax1) <= height)),
+                         key=lambda span: (span['bbox'][1], span['bbox'][0]))
+        stack = []
+        bottom = ay1
+        for span in aligned:
+            x0, y0, x1, y1 = span['bbox']
+            if y0 - bottom > 1.35 * height:
+                break
+            text = span['text'].strip()
+            if '\ufffd' in text:
+                bottom = y1
+                continue  # Broken CAD font encoding is not a usable literal note.
+            if re.fullmatch(r'/[1-9]\d*\.[0-9]', text):
+                bottom = y1
+                continue  # A cross-reference can be printed within the stack.
+            if not text or re.fullmatch(r'\d+|[A-Z]{1,3}\d?|[-+=][A-Z]+\d+[A-Z0-9]*', text, re.I):
+                break
+            if any(other is not anchor and abs(other['bbox'][0] - x0) <= height
+                   and abs(other['bbox'][1] - y0) < abs(ay0 - y0)
+                   for other in anchors):
+                break
+            stack.append(span)
+            bottom = y1
+            if len(stack) == 8:
+                break
+        if stack:
+            owners.setdefault(tag, []).extend(stack)
+    return owners
+
+
 def _rated_series_owner(model, anchors, ratings):
     """Recognise a three-line caption: indexed family, rating, complete order code."""
     mx0,my0,mx1,my1=model['bbox']

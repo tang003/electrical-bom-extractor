@@ -23,6 +23,12 @@ SOURCE_TYPE_CN = {
     SourceType.MANUAL_EDITED.value: "人工已改",
 }
 
+DRAWING_ANNOTATION_ROLES = {
+    'main_circuit': '位号', 'device_description': '器件说明',
+    'device_annotation': '功能 / 接口说明', 'model_text': '原图型号',
+    'model_candidate': '型号线索', 'specification': '技术参数',
+}
+
 
 def _style_worksheet(ws: openpyxl.worksheet.worksheet.Worksheet, header_row: int = 1) -> None:
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -156,6 +162,23 @@ def _export_diagnostics_to_excel(result: ExtractionResult, output_path: Path | s
         _style_worksheet(sheet)
     append_decisions(ws1,result.itemized_bom if result.extraction_mode=='PART_LIST_MODE' else result.aggregated_bom)
     if result.extraction_mode=='PART_LIST_MODE' and not table_only:append_decisions(ws2,result.aggregated_bom)
+
+    if result.extraction_mode=='SCHEMATIC_MODE':
+        ws=wb.create_sheet('图纸标注信息')
+        ws.append(['记录ID','位号','名称','图纸页','标注类型','原图文字','坐标框(norm_bbox)','采购范围'])
+        for item in [*result.itemized_bom,*result.filtered_items]:
+            seen=set()
+            for ev in sorted(item.evidences,key=lambda e:(e.page,e.norm_bbox[1],e.norm_bbox[0])):
+                if ev.role not in DRAWING_ANNOTATION_ROLES or not ev.raw_text.strip():
+                    continue
+                if ev.role=='main_circuit' and ev.raw_text.strip().upper().lstrip('-')!=item.tag.strip().upper().lstrip('-'):
+                    continue
+                key=(ev.page,ev.raw_text.strip(),tuple(ev.norm_bbox))
+                if key in seen:continue
+                seen.add(key)
+                ws.append([item.id,item.tag,item.name,ev.page,DRAWING_ANNOTATION_ROLES[ev.role],
+                           ev.raw_text,json.dumps(ev.norm_bbox),item.procurement_scope])
+        _style_worksheet(ws);ws.freeze_panes='F2';ws.auto_filter.ref=ws.dimensions
 
     # Sheet 3: 待人工审核与校验报告
     ws_rev = wb.create_sheet("待审核与校验报告")

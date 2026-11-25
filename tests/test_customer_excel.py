@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 import backend.app as backend
 from bom_extractor.customer_excel import HEADERS
 from bom_extractor.exporter import export_to_excel
-from bom_extractor.models import BOMItem,ExtractionResult,ReviewItem
+from bom_extractor.models import BOMItem,ExtractionResult,ReviewItem,EvidenceLocation
 from bom_extractor.rules import build_aggregated_from_itemized
 from bom_extractor.table_workflow import TABLE_POLICY,TABLE_MODE
 
@@ -48,6 +48,24 @@ def test_default_main_columns_layout_and_literal_identifiers(tmp_path):
     assert s.page_setup.orientation=='landscape'
     assert s.page_setup.fitToWidth==1 and s.page_setup.fitToHeight==0
     assert not s.sheet_view.showGridLines and s['C7'].alignment.wrap_text
+
+
+def test_diagnostic_export_keeps_each_drawing_annotation_with_its_position(tmp_path):
+    card=item(tag='-AX1515N',name='4轴数字量轴卡',model='CK3W_AX1515N',evidences=[
+        EvidenceLocation(6,[10,10,20,20],[.1,.1,.2,.2],'-AX1515N','main_circuit'),
+        EvidenceLocation(6,[10,20,30,25],[.1,.2,.3,.25],'4轴数字量轴卡','device_description'),
+        EvidenceLocation(6,[10,26,30,31],[.1,.26,.3,.31],'S轴命令端口','device_annotation'),
+        EvidenceLocation(6,[10,32,30,37],[.1,.32,.3,.37],'CK3W_AX1515N','model_text'),
+    ])
+    path=tmp_path/'diagnostic.xlsx'
+    export_to_excel(result([card]),path,diagnostic=True)
+    wb=openpyxl.load_workbook(path)
+    try:
+        lines=list(wb['图纸标注信息'].values)
+        assert [line[5] for line in lines[1:]]==['-AX1515N','4轴数字量轴卡','S轴命令端口','CK3W_AX1515N']
+        assert lines[3][4]=='功能 / 接口说明' and lines[3][6]=='[0.1, 0.26, 0.3, 0.31]'
+    finally:
+        wb.close()
 
 
 def test_supply_note_on_one_member_names_only_that_device_in_group(tmp_path):

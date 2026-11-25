@@ -16,7 +16,7 @@ from .ocr_engine import DualChannelOCREngine
 
 from .notation import (BREAKER_FAMILIES, COMPONENT_TAG_RE, MODEL_TOKEN_RE, POWER_CURRENT_LABEL, tagged_model_series, with_component_anchors, device_code, local_tag, qualify_tag,
                        is_connection_tag, is_field_load, model_compatible, model_family)
-from .spatial_binding import bind_models, device_captions
+from .spatial_binding import bind_models, device_captions, stacked_device_annotations
 from .procurement import range_annotations, flag_template_quantities, suggest
 from .terminal_positions import terminal_positions, apply_terminal_positions, vector_terminal_symbols
 from .reconciliation import norm
@@ -26,6 +26,13 @@ IGNORE_TAG_PREFIXES = ("-X", "=+-X", "-W", "-PE", "-M", "-YV", "DT", "-DT", "SP"
 
 def _dist(s1: Dict[str, Any], s2: Dict[str, Any]) -> float:
     return math.hypot(s1["cx"] - s2["cx"], s1["cy"] - s2["cy"])
+
+
+def _reference_gap(anchor_box, marker_box):
+    gap = marker_box[1] - anchor_box[3]
+    height = anchor_box[3] - anchor_box[1]
+    aligned = min(anchor_box[2], marker_box[2]) >= max(anchor_box[0], marker_box[0])
+    return gap if height > 0 and aligned and -.3 * height <= gap <= 2.0 * height else None
 
 
 def _is_model_compatible_with_tag(tag: str, model_text: str) -> bool:
@@ -203,6 +210,7 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
     observations={}
     bindings={}
     descriptions={}
+    annotation_stacks={}
     cross_references={}
     vector_findings=[]
     cabinet_modules=[]
@@ -256,9 +264,9 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
                 reference = re.fullmatch(r'/([1-9]\d*)\.([0-9])', other['text'].strip())
                 if not reference:
                     continue
-                gap = other['bbox'][1] - span['bbox'][3]
-                aligned = min(span['bbox'][2], other['bbox'][2]) >= max(span['bbox'][0], other['bbox'][0])
-                if -.3 * (span['bbox'][3] - span['bbox'][1]) <= gap <= 1.5 * (span['bbox'][3] - span['bbox'][1]) and aligned:
+                # Contact terminals can sit between the tag and its sheet/column
+                # marker; the old 1.5-line limit missed e.g. -KA14 /17.1.
+                if _reference_gap(span['bbox'], other['bbox']) is not None:
                     cross_references.setdefault(tag, []).append((info.page_num, other, int(reference[1]), int(reference[2])))
         modules,reserved_handles=read_rack(page,body,info)
         cabinet_modules.extend(modules)
@@ -281,6 +289,8 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
                 title_numbers.setdefault(text,[]).append((info.page_num,x,y))
         for tag, labels in device_captions(body, anchors, enclosures).items():
             descriptions.setdefault(tag, []).extend((info.page_num, sp) for sp in labels)
+        for tag, labels in stacked_device_annotations(body, anchors).items():
+            annotation_stacks.setdefault(tag, []).extend((info.page_num, sp) for sp in labels)
         for tag,matches in bound.items():
             bindings.setdefault(tag,[]).extend({**match,'page':info.page_num} for match in matches)
         info.extraction_diagnostics={**info.extraction_diagnostics,'range_annotations':range_annotations(body, info.title),'native_characters':sum(len(sp['text']) for sp in native),
@@ -334,6 +344,7 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
         cross_references.setdefault(canonical, []).extend(cross_references.pop(alias, []))
         bindings.setdefault(canonical, []).extend(bindings.pop(alias, []))
         descriptions.setdefault(canonical, []).extend(descriptions.pop(alias, []))
+        annotation_stacks.setdefault(canonical, []).extend(annotation_stacks.pop(alias, []))
         for finding in vector_findings:
             if finding.get('tag') == alias:
                 finding['tag'] = canonical
@@ -456,6 +467,12 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
             for page_num, span in labels:
                 evidences.append(EvidenceLocation(page_num, span['bbox'], span['norm_bbox'],
                                                   raw_text=span['text'], role='device_description', device_tag=tag))
+        for page_num, span in annotation_stacks.get(tag, []):
+            text=span['text'].strip()
+            if not any(ev.page==page_num and ev.raw_text.strip()==text
+                       and ev.bbox==span['bbox'] for ev in evidences):
+                evidences.append(EvidenceLocation(page_num, span['bbox'], span['norm_bbox'],
+                                                  raw_text=text, role='device_annotation', device_tag=tag))
         if name == "开关器件（型式待核）":
             needs_review = True
             note = "已读到开关型号，原图文字未明确具体开关型式，按订货号核实。"
@@ -861,3 +878,60 @@ def _extract_wires_and_terminals(
         ))
 
     return items, reviews
+
+
+def recover_cross_reference_evidence(doc, result, page_num=None):
+    """Add missing sheet/column links to saved items without re-extracting the BOM."""
+    pages = {info.page_num: info for info in result.pages}
+    if page_num is not None and page_num not in pages:
+        raise ValueError('图纸页码无效')
+    sheets = {}
+    for info in result.pages:
+        if str(info.sheet_no).isdigit():
+            sheets.setdefault(int(info.sheet_no), []).append(info.page_num)
+    items = result.itemized_bom + result.filtered_items
+    anchor_roles = {'main_circuit', 'coil', 'device', 'contact_or_symbol'}
+    added = 0
+    for source_page in ([page_num] if page_num is not None else sorted(pages)):
+        anchors = [(item, ev) for item in items for ev in item.evidences
+                   if ev.page == source_page and ev.role in anchor_roles and ev.bbox]
+        if not anchors:
+            continue
+        page = doc[source_page - 1]
+        native = extract_visual_spans(page)
+        spans = DualChannelOCREngine.extract_dual_channel_spans(page, native, dpi=200)
+        for marker in spans:
+            reference = re.fullmatch(r'/([1-9]\d*)\.([0-9])', marker['text'].strip())
+            if not reference:
+                continue
+            matches = []
+            for item, anchor in anchors:
+                gap = _reference_gap(anchor.bbox, marker['bbox'])
+                if gap is not None:
+                    ax = (anchor.bbox[0] + anchor.bbox[2]) / 2
+                    mx = (marker['bbox'][0] + marker['bbox'][2]) / 2
+                    matches.append((max(0, gap), abs(ax - mx), item))
+            if not matches:
+                continue
+            matches.sort(key=lambda entry: entry[:2])
+            item = matches[0][2]
+            if any(ev.role == 'cross_reference' and ev.page == source_page and
+                   all(abs(a - b) < 1 for a, b in zip(ev.bbox, marker['bbox']))
+                   for ev in item.evidences):
+                continue
+            sheet, column = int(reference[1]), int(reference[2])
+            target_pages = sheets.get(sheet, [])
+            grid_x = {target: next((entry['x'] for entry in
+                      pages[target].extraction_diagnostics.get('drawing_grid_columns', [])
+                      if entry['number'] == column), None) for target in target_pages}
+            resolved = any(ev.page == target and ev.role in anchor_roles and
+                           (grid_x[target] is None or
+                            abs((ev.norm_bbox[0] + ev.norm_bbox[2]) / 2 - grid_x[target]) <= .1)
+                           for target in target_pages for ev in item.evidences)
+            item.evidences.append(EvidenceLocation(
+                source_page, marker['bbox'], marker['norm_bbox'], raw_text=marker['text'],
+                role='cross_reference', device_tag=item.tag,
+                cad_refs=[{'sheet': sheet, 'column': column, 'target_pages': target_pages,
+                           'resolved': resolved, 'column_verified': any(x is not None for x in grid_x.values())}]))
+            added += 1
+    return added

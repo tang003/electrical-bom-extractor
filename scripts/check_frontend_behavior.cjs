@@ -33,9 +33,42 @@ function fixture(id='fixture') {
 const response = data=>({ok:true,json:async()=>data});
 
 (async()=>{
+  assert.equal(app.showSomLayer.value,true,'Open the drawing with system candidate boxes visible');
+  app.showSomLayer.value=false; // Isolate the candidate grouping fixtures below from live overlay additions.
   assert.equal(app.leftPaneWidth.value,60,'Give the drawing most of the default comparison view');
   assert.equal(app.overviewExpanded.value,false,'Keep the drawing workspace tall by default');
   app.toggleOverview();
+  const viewport={scrollLeft:180,scrollTop:260,clientWidth:500,clientHeight:350,scrollWidth:900,scrollHeight:600,
+    getBoundingClientRect:()=>({left:0,top:0,width:500,height:350})};
+  app.pdfViewportRef.value=viewport;
+  app.projectData.value={...fixture(),page_count:4,pages:[1,2,3,4].map(page_num=>({page_num,width:600,height:900}))};
+  app.currentPage.value=2;
+  const wheel=(deltaY,timeStamp,extra={})=>({deltaY,deltaX:0,deltaMode:0,timeStamp,clientX:250,clientY:170,...extra});
+  app.handleCanvasWheel(wheel(40,1000));
+  assert.equal(app.currentPage.value,2,'A small touchpad movement must not turn a page');
+  app.handleCanvasWheel(wheel(45,1020));
+  assert.equal(app.currentPage.value,3,'Accumulated wheel movement turns one page');
+  await context.Vue.nextTick();
+  assert.equal(viewport.scrollLeft,180,'Page turn keeps the horizontal drawing position');
+  assert.equal(viewport.scrollTop,0,'Page turn begins at the top of the next sheet');
+  app.handleCanvasWheel(wheel(100,1100));
+  assert.equal(app.currentPage.value,3,'Touchpad momentum must not skip another page');
+  app.handleCanvasWheel(wheel(100,1400));
+  assert.equal(app.currentPage.value,4,'A new gesture turns the next page');
+  app.handleCanvasWheel(wheel(100,1800));
+  assert.equal(app.currentPage.value,4,'Wheel navigation stops at the final page');
+  app.handleCanvasWheel(wheel(-100,1810));
+  assert.equal(app.currentPage.value,3,'Reversing the wheel direction turns back immediately');
+  app.handleCanvasWheel(wheel(-100,1830,{ctrlKey:true}));
+  assert.equal(app.currentPage.value,3,'Ctrl-wheel must keep the current page');
+  assert.equal(app.zoomPercent.value,120,'Ctrl-wheel zooms the drawing at the pointer');
+  app.handleCanvasWheel(wheel(60,1850,{shiftKey:true}));
+  assert.equal(app.currentPage.value,3,'Shift-wheel pans without turning pages');
+  app.fitDrawingPage();
+  assert.equal(app.zoomPercent.value,44,'Fit-page zoom uses the current sheet dimensions and viewport height');
+  app.resetZoom();
+  assert.equal(app.zoomPercent.value,100,'Fit-width returns to 100 percent');
+  app.pdfViewportRef.value=null;
   assert.equal(app.overviewExpanded.value,true);
   assert.equal(JSON.parse(storage.get('electrical-bom-workspace')).overviewExpanded,true);
   app.toggleOverview();
@@ -63,6 +96,59 @@ const response = data=>({ok:true,json:async()=>data});
   app.searchQuery.value='hidden by filter';app.selectSomCandidate(app.filteredSomCandidates.value[0]);
   assert.equal(app.selectedItemId.value,'local');assert.equal(app.searchQuery.value,'');
   assert.equal(JSON.stringify(app.projectData.value),beforeSom,'Filters and candidate clicks never change quantities or saved evidence');
+  const terminalBoxes=[.10,.14,.18,.22,.65].map((x,index)=>candidate(20+index,
+    index===1 ? '-X10:2' : index===4 ? '-X10:1~15' : '-X10',{
+    norm_bbox:[x,.30,x+.024,.325],anchor_norm_bbox:[x,.30,x+.024,.325]}));
+  app.pageTopology.value={...topo,candidates:[...terminalBoxes,candidate(30,'-X11',{
+    norm_bbox:[.28,.30,.304,.325],anchor_norm_bbox:[.28,.30,.304,.325]})]};
+  const compactBoxes=app.overlaySomCandidates.value;
+  assert.equal(compactBoxes.length,6,'Every terminal candidate remains available for selection');
+  assert.equal(compactBoxes.filter(c=>c.terminalStripLabel==='-X10' && c.terminalBadgeVisible).length,2,
+    'Nearby positions share one label while a separate strip segment keeps its own label');
+  assert.equal(compactBoxes.filter(c=>c.terminalStripLabel==='-X10' && !c.terminalBadgeVisible).length,3,
+    'Repeated position labels are visually compacted without dropping their hitboxes');
+  assert.equal(compactBoxes.find(c=>c.tag==='-X11').terminalCompact,false,'Other terminal strips stay independent');
+  assert.equal(app.somCounts.value.ALL,6,'Visual grouping does not change candidate counts');
+  const savedSomProject=app.projectData.value;
+  const linkedTerminal={...somItem('terminal','-X10:1~15','terminal','terminal_symbol'),terminal_strip_tag:'-X10',quantity:15};
+  app.projectData.value={...savedSomProject,itemized_bom:[linkedTerminal],aggregated_bom:[linkedTerminal]};
+  app.pageTopology.value={...topo,candidates:[candidate(31,'-X10')]};
+  assert.equal(app.filteredSomCandidates.value[0].kind,'linked',
+    'A strip label must link to its numbered terminal material row instead of becoming a yellow pending box');
+  const savedTab=app.activeTab.value,savedFollow=app.followDrawingPage.value,savedLayer=app.showSomLayer.value;
+  app.activeTab.value='secondary';app.followDrawingPage.value=true;app.showSomLayer.value=true;
+  linkedTerminal.evidences=[1,2,3].map(number=>({page:1,role:'terminal_symbol',raw_text:String(number),
+    norm_bbox:[.2+number*.04,.2,.21+number*.04,.22]}));
+  assert.equal(app.overlaySomCandidates.value.filter(c=>c.terminalStripLabel==='-X10' && c.terminalBadgeVisible).length,1,
+    'The actual BOM evidence overlays show one label for the numbered terminal positions');
+  assert.ok(app.overlaySomCandidates.value.some(c=>c.display_label==='-X10:2'),
+    'Each terminal remains individually identifiable on hover or selection');
+  app.activeTab.value=savedTab;app.followDrawingPage.value=savedFollow;app.showSomLayer.value=savedLayer;
+  app.projectData.value=savedSomProject;
+  app.pageTopology.value=topo;
+  const x2Plain={...somItem('x2-plain','-X2:1~3','terminal','terminal_symbol'),terminal_strip_tag:'-X2',model:'PT6',quantity:3,unit:'片',
+    evidences:[{page:1,role:'terminal_symbol',raw_text:'1',norm_bbox:[.35,.35,.36,.37]}]};
+  const x2Pe={...somItem('x2-pe','-X2:4','terminal','terminal_symbol'),terminal_strip_tag:'-X2',model:'PT6-PE',quantity:1,unit:'片',
+    evidences:[{page:1,role:'terminal_symbol',raw_text:'4',norm_bbox:[.6,.35,.61,.37]}]};
+  app.projectData.value={...savedSomProject,itemized_bom:[x2Plain,x2Pe],aggregated_bom:[x2Plain,x2Pe]};
+  app.pageTopology.value={...topo,candidates:[candidate(32,'-X2')]};
+  const x2Group=app.filteredSomCandidates.value[0];
+  assert.equal(x2Group.kind,'linked','A strip with two material rows is linked at the strip level, not yellow pending');
+  assert.equal(x2Group.matched_item_id,'','The strip heading must not be assigned to just one material model');
+  assert.deepEqual(Array.from(x2Group.terminal_group_rows,row=>row.tag),['-X2:1~3','-X2:4']);
+  app.selectSomCandidate(x2Group);
+  assert.equal(app.searchQuery.value,'-X2','Selecting a mixed strip shows both material rows');
+  app.searchQuery.value='';app.activeTab.value=savedTab;app.followDrawingPage.value=savedFollow;
+  const x4Plain={...x2Plain,tag:'-X4:1~2',tags:['-X4:1~2'],terminal_strip_tag:'-X4'};
+  const x4Pe={...x2Pe,tag:'-X4:3',tags:['-X4:3'],terminal_strip_tag:'-X4'};
+  app.projectData.value={...savedSomProject,itemized_bom:[x4Plain,x4Pe],aggregated_bom:[x4Plain,x4Pe]};
+  app.pageTopology.value={...topo,candidates:[candidate(33,'-X4',{
+    norm_bbox:[.2262,.7084,.3009,.7614],anchor_norm_bbox:[.2682,.7252,.2815,.7379]})]};
+  const x4Anchor=app.filteredSomCandidates.value[0];
+  assert.equal(x4Anchor.terminalStripAnchor,true,'A terminal strip heading uses its literal tag anchor');
+  assert.ok(x4Anchor.norm_bbox[0]>.25 && x4Anchor.norm_bbox[2]<.31 && x4Anchor.norm_bbox[3]-x4Anchor.norm_bbox[1]<.04,
+    'The X4 heading must not inherit a wide box that also encloses the adjacent X3 terminal');
+  app.projectData.value=savedSomProject;app.pageTopology.value=topo;
   app.projectData.value.pages[0].function_code='=B';
   assert.equal(app.filteredSomCandidates.value.find(c=>c.tag==='-K2').matched_item_id,'scope-b','Use the complete page scope instead of choosing the first local tag');
   app.clearActiveBox();
@@ -203,7 +289,61 @@ const response = data=>({ok:true,json:async()=>data});
   assert.deepEqual(Array.from(app.currentTableItems.value,it=>it.id),['lower','right','unmapped','left']);
   app.activeTab.value='primary';
   assert.deepEqual(Array.from(app.currentTableItems.value,it=>it.id),['merged']);
+  const x3Pt4={...somItem('x3-pt4','-X3:1~2','terminal','terminal_symbol'),
+    terminal_strip_tag:'-X3',terminal_numbers:[1,2],model:'PT4',quantity:2,
+    evidences:[point(1,.150,.728,'terminal_symbol'),point(1,.190,.728,'terminal_symbol')]};
+  const x3Pe={...somItem('x3-pe','-X3:3','terminal','terminal_symbol'),
+    terminal_strip_tag:'-X3',terminal_numbers:[3],model:'PT4-PE',quantity:1,
+    evidences:[point(1,.226,.728,'terminal_symbol')]};
+  const f6={...somItem('f6','-F6'),evidences:[point(1,.238,.252,'device')]};
+  app.projectData.value={...fixture(),pages:[{page_num:1,page_type:'CONTROL_CIRCUIT'}],
+    itemized_bom:[f6,x3Pe,x3Pt4],aggregated_bom:[f6,x3Pe,x3Pt4]};
+  app.currentPage.value=1;app.activeTab.value='secondary';app.followDrawingPage.value=true;
+  assert.deepEqual(Array.from(app.currentTableItems.value,item=>item.id),['x3-pt4','x3-pe','f6'],
+    'Circuit order keeps different materials from the same terminal strip together before the next device');
+  assert.deepEqual(Array.from(app.currentTableItems.value,item=>item.quantity),[2,1,undefined],
+    'Grouping does not change the two terminal material quantities');
+  assert.deepEqual(Array.from(app.pagePositions.value.values(),entry=>entry.number),[1,2,3]);
+  app.pageOrderMode.value='visual';
+  assert.deepEqual(Array.from(app.currentTableItems.value,item=>item.id),['f6','x3-pt4','x3-pe'],
+    'Visual order still begins at the top of the page while keeping terminal rows together');
+  app.pageOrderMode.value='circuit';
+  const x7Positions=[[1,.740,.421],[4,.702,.555],[2,.816,.421],[5,.797,.555],[6,.873,.555],[3,.978,.421],[7,.930,.555]];
+  const x7={...somItem('x7','-X7:1~7','terminal','terminal_symbol'),terminal_strip_tag:'-X7',terminal_numbers:[1,2,3,4,5,6,7],quantity:7,
+    evidences:[{page:1,role:'main_circuit',raw_text:'X7',norm_bbox:[.7266,.414,.7357,.4267]},
+      ...x7Positions.map(([number,x,y])=>({page:1,role:'terminal_symbol',raw_text:String(number),norm_bbox:[x,y,x+.005,y+.007]}))]};
+  app.projectData.value={...fixture(),pages:[{page_num:1,page_type:'CONTROL_CIRCUIT'}],itemized_bom:[x7],aggregated_bom:[x7]};
+  app.pageTopology.value=null;app.showSomLayer.value=true;
+  assert.ok(app.overlaySomCandidates.value.some(c=>c.tag==='-X7' && c.terminalStripAnchor && c.detector_source==='BOM_STRIP_HEADER'),
+    'A literal X7 header in saved evidence gets a dashed strip marker when topology omitted it');
+  const x7First=app.filteredSomCandidates.value.find(c=>c.display_label==='-X7:1');
+  const x7Second=app.filteredSomCandidates.value.find(c=>c.display_label==='-X7:2');
+  assert.ok(x7First && x7Second,'Each saved terminal position remains independently clickable');
+  app.selectSomCandidate(x7First);
+  assert.equal(app.selectedDrawingHit.value.label,'-X7:1');
+  const firstHitSequence=app.selectedDrawingHit.value.sequence;
+  app.selectSomCandidate(x7Second);
+  assert.equal(app.selectedItemId.value,'x7','Sibling terminals remain in one BOM material row');
+  assert.equal(app.selectedDrawingHit.value.label,'-X7:2','The right pane shows the exact terminal clicked on the drawing');
+  assert.ok(app.selectedDrawingHit.value.sequence>firstHitSequence,'Each click can renew the row feedback');
+  app.selectedItemId.value='x7';app.selectedEvidences.value=app.pagePositions.value.get('x7').locations;
+  assert.deepEqual(Array.from(app.displayedEvidences.value,e=>e.raw_text),['1','2','3','4','5','6','7'],
+    'Terminal navigation follows unique printed numbers rather than the spatial column scan');
+  const x8={...x7,id:'x8',tag:'-X8:1~6',tags:['-X8:1~6'],terminal_strip_tag:'-X8',
+    evidences:[[1,.2,.2],[2,.3,.2],[1,.2,.6],[2,.3,.6]].map(([number,x,y])=>
+      ({page:1,role:'terminal_symbol',raw_text:String(number),norm_bbox:[x,y,x+.005,y+.007]}))};
+  app.projectData.value={...fixture(),pages:[{page_num:1,page_type:'CONTROL_CIRCUIT'}],itemized_bom:[x8],aggregated_bom:[x8]};
+  app.selectedItemId.value='x8';app.selectedEvidences.value=app.pagePositions.value.get('x8').locations;
+  assert.deepEqual(Array.from(app.displayedEvidences.value,e=>e.raw_text),['1','2','1','2'],
+    'Reused terminal numbers retain segment order instead of being interleaved numerically');
+  assert.deepEqual(Array.from(app.evidenceChipLabels.value),['-X8:1（上）','-X8:2（上）','-X8:1（下）','-X8:2（下）'],
+    'Only repeated terminal numbers need a short spatial suffix');
+  app.selectedEvidences.value=[...x8.evidences,{page:2,role:'terminal_symbol',raw_text:'3',norm_bbox:[.2,.2,.205,.207]}];
+  assert.equal(app.evidenceChipLabels.value[4],'-X8:3',
+    'Page number belongs in the page group, not each terminal chip');
+  app.showSomLayer.value=false;
   app.clearActiveBox();app.currentPage.value=1;app.pageTopology.value=null;
+  assert.equal(app.selectedDrawingHit.value,null,'Clearing the drawing selection removes the exact-position notice');
   app.projectData.value=fixture();
   app.currentProjectId.value='fixture';
   assert.equal(app.issueCounts.value.ALL,3);
@@ -373,6 +513,35 @@ const response = data=>({ok:true,json:async()=>data});
     {norm_bbox:[.1,.19,.3,.8],anchor_norm_bbox:[.19,.2,.21,.22],detector_source:'VECTOR_SYMBOL+TAG_ANCHOR'})]};
   assert.ok(app.filteredSomCandidates.value[0].norm_bbox[3]-app.filteredSomCandidates.value[0].norm_bbox[1]<.1,
     'An unverified legacy candidate must not stretch from U1 down into KM1');
+  const page3Items=[
+    ['sx2','-SX2',[.6653,.7102,.7072,.7529]],
+    ['sx1','-SX1',[.7605,.7102,.8024,.7529]],
+    ['fm1','-FM1',[.8272,.7102,.8691,.7529]],
+    ['l1','-L1',[.8936,.7102,.9309,.7529]],
+  ].map(([id,tag,box])=>({...somItem(id,tag),evidences:[{page:3,norm_bbox:box,raw_text:tag,role:'main_circuit'}]}));
+  const page3Candidates=[
+    ['-SX2',[.6453,.6777,.7548,.7724],[.6773,.7252,.6952,.7379]],
+    ['-SX1',[.7625,.6777,.8309,.7619],[.7725,.7252,.7904,.7379]],
+    ['-FM1',[.8085,.6835,.8951,.7912],[.8392,.7252,.8571,.7379]],
+    ['-L1',[.8683,.6777,.9427,.7939],[.9056,.7252,.9189,.7379]],
+  ].map(([tag,box,anchor],index)=>candidate(index+20,tag,{norm_bbox:box,anchor_norm_bbox:anchor,
+    bbox_source:'tag_and_nearby_geometry',detector_source:'VECTOR_SYMBOL+TAG_ANCHOR'}));
+  app.projectData.value={...fixture('page3'),pages:[{page_num:3}],itemized_bom:page3Items,aggregated_bom:page3Items};
+  app.currentProjectId.value='page3';app.currentPage.value=3;
+  app.pageTopology.value={...topo,project_id:'page3',page_num:3,candidates:page3Candidates,excluded_candidates:[]};
+  const neat=app.filteredSomCandidates.value;
+  assert.ok(neat[0].norm_bbox[0]>.65 && neat[0].norm_bbox[1]>.69,
+    'SX2 display box must drop nearby terminal and wire text outside its own device');
+  for (let i=1;i<neat.length;i++) assert.ok(neat[i-1].norm_bbox[2]<=neat[i].norm_bbox[0],
+    'Adjacent page 3 device boxes must not overlap');
+  const axisCard={...somItem('axis','-AX1515N'),name:'4轴数字量轴卡',model:'CK3W_AX1515N',evidences:[
+    {page:6,role:'main_circuit',raw_text:'-AX1515N',norm_bbox:[.27,.07,.31,.08]},
+    {page:6,role:'device_description',raw_text:'4轴数字量轴卡',norm_bbox:[.27,.08,.34,.09]},
+    {page:6,role:'device_annotation',raw_text:'S轴命令端口',norm_bbox:[.27,.09,.34,.10]},
+    {page:6,role:'model_text',raw_text:'CK3W_AX1515N',norm_bbox:[.27,.10,.34,.11]}]};
+  assert.deepEqual(Array.from(app.drawingAnnotations(axisCard),line=>line.raw_text),
+    ['-AX1515N','4轴数字量轴卡','S轴命令端口','CK3W_AX1515N']);
+  assert.equal(app.drawingAnnotationSummary(axisCard),'4轴数字量轴卡；S轴命令端口');
   const printedGrid=Array.from({length:10},(_,number)=>({number,x:.065+number*.088}));
   const km2={...somItem('km2','-KM2'),evidences:[
     {page:2,role:'main_circuit',norm_bbox:[.44,.65,.48,.69],raw_text:'-KM2'},
@@ -385,14 +554,80 @@ const response = data=>({ok:true,json:async()=>data});
     itemized_bom:[km2],aggregated_bom:[km2]};
   app.currentProjectId.value='grid';app.currentPage.value=2;app.showSomLayer.value=false;
   assert.equal(app.pageGridBands.value.length,10);
+  assert.equal(app.itemDrawingReference(km2).label,'P2.4','List references use the printed grid and the device anchor');
+  await app.locateItem(km2);
+  assert.equal(app.currentPage.value,2);
+  assert.equal(app.activeGridColumn.value.number,4,'Clicking the row highlights the same column printed in its reference');
+  assert.deepEqual(Array.from(app.activeBox.value.norm_bbox),[.44,.65,.48,.69]);
+  const wide={...km2,id:'wide',evidences:[{page:2,role:'device',norm_bbox:[.1,.2,.5,.3]}]};
+  assert.equal(app.itemDrawingReference(wide).label,'P2','A multi-column device box does not guess one column');
+  const noGrid={...km2,id:'no-grid',primary_page:3,evidences:[{page:3,role:'device',norm_bbox:[.4,.2,.42,.25]}]};
+  assert.equal(app.itemDrawingReference(noGrid).label,'P3','Pages without a reliable grid retain a page-only reference');
+  app.projectData.value.pages.push({page_num:18,sheet_no:'17',extraction_diagnostics:{drawing_grid_columns:printedGrid}});
+  const shifted={...km2,id:'shifted',primary_page:18,evidences:[{page:18,role:'device',norm_bbox:[.49,.2,.52,.25]}]};
+  assert.equal(app.itemDrawingReference(shifted).label,'图17.5 · P18','Drawing sheet and PDF page stay distinct');
   const jump=app.crossPageLinks.value.find(link=>link.evidence.raw_text==='/16.7');
   assert.equal(jump.targetPage,16);
+  app.pageReferenceIndex.value={project_id:'grid',links:[
+    {key:'same',source_page:2,source_bbox:[.47,.70,.49,.71],source_text:'/16.7',
+      sheet:16,column:7,target_page:16,grid_x:printedGrid[7].x,column_verified:true},
+    {key:'generic',source_page:2,source_bbox:[.2,.4,.23,.42],source_text:'16.3/',
+      sheet:16,column:3,target_page:16,grid_x:printedGrid[3].x,column_verified:true}]};
+  assert.equal(app.crossPageLinks.value.length,2,'The page index adds general links without duplicating BOM links');
+  app.zoomPercent.value=74;
+  assert.equal(app.visibleCrossPageLinks.value.length,0,'Reference icons hide below 75% zoom');
+  app.zoomPercent.value=75;
+  assert.equal(app.visibleCrossPageLinks.value.length,2,'Reference icons return at 75% zoom');
+  app.zoomPercent.value=100;
+  const genericJump=app.crossPageLinks.value.find(link=>!link.item);
   assert.deepEqual(Array.from(jump.targetBox),[.68,.2,.72,.24]);
   await app.jumpToCrossReference(jump);
   assert.equal(app.currentPage.value,16);
   assert.equal(app.activeGridColumn.value.number,7);
   assert.equal(app.selectedItemId.value,'km2');
   assert.deepEqual(Array.from(app.activeBox.value.norm_bbox),[.68,.2,.72,.24]);
+  await app.jumpToCrossReference(genericJump);
+  assert.equal(app.currentPage.value,16);
+  assert.equal(app.activeGridColumn.value.number,3);
+  assert.equal(app.selectedItemId.value,'');
+  const ka14={...somItem('ka14','-KA14'),evidences:[
+    {page:17,role:'contact_or_symbol',norm_bbox:[.57,.20,.61,.24],raw_text:'-KA14'},
+    {page:17,role:'contact_or_symbol',norm_bbox:[.18,.20,.22,.24],raw_text:'-KA14'},
+    {page:17,role:'cross_reference',norm_bbox:[.58,.24,.61,.26],raw_text:'/17.1',
+      cad_refs:[{sheet:17,column:1,target_pages:[17],resolved:true,column_verified:true}]}]};
+  app.projectData.value={...fixture('same-page'),page_count:17,pages:[
+    {page_num:17,sheet_no:'17',page_type:'CONTROL_CIRCUIT',extraction_diagnostics:{drawing_grid_columns:printedGrid}}],
+    itemized_bom:[ka14],aggregated_bom:[ka14]};
+  app.currentProjectId.value='same-page';app.currentPage.value=17;
+  const samePageJump=app.crossPageLinks.value[0];
+  assert.deepEqual(Array.from(samePageJump.targetBox),[.18,.20,.22,.24]);
+  await app.jumpToCrossReference(samePageJump);
+  assert.equal(app.currentPage.value,17);
+  assert.equal(app.activeGridColumn.value.number,1);
+  assert.deepEqual(Array.from(app.activeBox.value.norm_bbox),[.18,.20,.22,.24]);
+  const m1={...somItem('m1','-M1'),procurement_scope:'field',evidences:[
+    {page:8,role:'main_circuit',norm_bbox:[.84,.06,.86,.09],raw_text:'-M1'},
+    {page:8,role:'cross_reference',norm_bbox:[.8405,.0732,.8533,.0823],raw_text:'/9.8',
+      cad_refs:[{sheet:9,column:8,target_pages:[9],resolved:true,column_verified:true}]},
+    {page:9,role:'main_circuit',norm_bbox:[.83,.3,.87,.35],raw_text:'-M1'}]};
+  app.projectData.value={...fixture('motor'),page_count:9,pages:[
+    {page_num:8,sheet_no:'8',extraction_diagnostics:{drawing_grid_columns:printedGrid}},
+    {page_num:9,sheet_no:'9',extraction_diagnostics:{drawing_grid_columns:printedGrid}}],
+    itemized_bom:[km2],aggregated_bom:[km2],filtered_items:[m1]};
+  app.currentProjectId.value='motor';app.currentPage.value=8;
+  app.pageTopology.value={...topo,project_id:'motor',page_num:8,candidates:[candidate(80,'-M1',{
+    norm_bbox:[.8357,.0541,.9833,.4041],anchor_norm_bbox:[.84,.06,.86,.09],
+    bbox_source:'vector_device_outline'})],excluded_candidates:[]};
+  assert.equal(app.filteredSomCandidates.value[0].kind,'filtered',
+    'A field motor already in filtered items must not be presented as an unmatched candidate');
+  app.selectSomCandidate(app.filteredSomCandidates.value[0]);
+  assert.equal(app.activeTab.value,'filtered');
+  assert.equal(app.selectedItemObj.value.id,'m1');
+  const motorJump=app.crossPageLinks.value.find(link=>link.evidence.raw_text==='/9.8');
+  assert.equal(motorJump.targetPage,9);
+  await app.jumpToCrossReference(motorJump);
+  assert.equal(app.currentPage.value,9);
+  assert.equal(app.activeGridColumn.value.number,8);
   const preview={...fixture('preview'),page_count:7,pages:Array.from({length:7},(_,i)=>({page_num:i+1})),
     itemized_bom:[terminalRow],aggregated_bom:[terminalRow]};
   context.window.location={search:'?project=preview&page=7&tag=-X14'};

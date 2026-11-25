@@ -333,7 +333,7 @@ body {
   border-color: #f59e0b;
 }
 
-/* Interactive Pan & Wheel-Zoom Viewport (Fixed Flex-Centering Overflow Bug!) */
+/* Interactive Pan, Wheel-Page, and Ctrl-Wheel-Zoom Viewport */
 .pdf-canvas-viewport {
   flex: 1;
   overflow: auto;
@@ -350,6 +350,43 @@ body {
 .pdf-canvas-viewport.draw-mode {
   cursor: crosshair;
 }
+
+.drawing-zoom-toolbar {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 46;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid #475569;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, .94);
+  color: #e2e8f0;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .3);
+}
+.drawing-zoom-toolbar button {
+  min-width: 28px;
+  height: 27px;
+  padding: 0 5px;
+  border: 1px solid #475569;
+  border-radius: 5px;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 12px;
+  cursor: pointer;
+}
+.drawing-zoom-toolbar button:hover:not(:disabled),
+.drawing-zoom-toolbar button:focus-visible {
+  background: #2563eb;
+  border-color: #60a5fa;
+}
+.drawing-zoom-toolbar button:disabled { opacity: .45; cursor: default; }
+.drawing-zoom-toolbar output { min-width: 39px; text-align: center; font: 700 11px Consolas, monospace; }
+.drawing-zoom-toolbar .drawing-zoom-fit { font-size: 10px; }
+.drawing-wheel-hint { padding: 0 5px; color: #a5b4fc; font-size: 10px; white-space: nowrap; }
+@media (max-width: 850px) { .drawing-wheel-hint { display: none; } }
 
 .manual-draw-rect {
   position: absolute;
@@ -455,23 +492,23 @@ body {
 .cross-page-link {
   position: absolute;
   z-index: 35;
-  min-width: 34px;
-  padding: 2px 4px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  transform: translateY(-50%);
   border: 1px solid #0284c7;
-  border-radius: 4px;
-  background: rgba(224, 242, 254, .96);
+  border-radius: 3px;
+  background: rgba(224, 242, 254, .75);
   color: #075985;
-  font: 700 10px Consolas, monospace;
-  white-space: nowrap;
+  font: 700 12px/14px Consolas, monospace;
+  text-align: center;
   cursor: pointer;
-  box-shadow: 0 1px 4px rgba(15, 23, 42, .25);
 }
 .cross-page-link:hover,
 .cross-page-link:focus-visible {
   background: #0284c7;
   color: #fff;
 }
-
 /* Interactive SoM Candidate Boxes on Drawing */
 .som-box-overlay {
   position: absolute;
@@ -522,6 +559,30 @@ body {
   z-index: 32;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.85);
 }
+
+.ai-crop-outline {
+  position: absolute;
+  box-sizing: border-box;
+  border: 2px dashed #0d9488;
+  background: rgba(13, 148, 136, 0.055);
+  pointer-events: none;
+  z-index: 34;
+}
+.ai-crop-outline > span {
+  position: absolute;
+  left: -2px;
+  bottom: 100%;
+  padding: 1px 5px;
+  border-radius: 3px 3px 0 0;
+  background: #0d9488;
+  color: #fff;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.field-crop-texts { margin-top: 8px; color: #475569; font-size: 12px; }
+.field-crop-texts summary { cursor: pointer; }
+.field-crop-texts p { line-height: 1.6; overflow-wrap: anywhere; }
 
 .bbox-highlight {
   position: absolute;
@@ -721,6 +782,13 @@ body {
   font-size: 11px;
   border: 1px solid #475569;
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.ev-page-label {
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 700;
   flex-shrink: 0;
 }
 .ev-chip:hover {

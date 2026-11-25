@@ -2,13 +2,14 @@
 
 import pymupdf
 import pytest
+from types import SimpleNamespace
 
 from bom_extractor.classifier import extract_visual_spans
-from bom_extractor.models import PageInfo
+from bom_extractor.models import BOMItem, EvidenceLocation, PageInfo
 from bom_extractor.notation import extract_model_strings, model_compatible
 from bom_extractor.ocr_engine import DualChannelOCREngine
 from bom_extractor.rules import load_rules_config
-from bom_extractor.schematic_extractor import extract_from_schematic_pdf, _preferred_device_caption
+from bom_extractor.schematic_extractor import extract_from_schematic_pdf, _preferred_device_caption, recover_cross_reference_evidence
 from bom_extractor.vision import VisionRecognizer
 
 
@@ -137,7 +138,7 @@ def test_axis_card_code_and_caption_are_owned_by_their_printed_tag(monkeypatch):
     def with_captions(page, spans, **kwargs):
         captions = []
         for x, label in ((100, '4轴数字量轴卡'), (320, '4轴模拟量轴卡')):
-            for text, y in ((label, 104), ('轴卡', 111)):
+            for text, y in ((label, 104), ('轴卡', 111), ('S轴命令端口', 118)):
                 box = [x, y, x + len(text) * 6, y + 6]
                 captions.append({'text':text, 'bbox':box,
                                  'norm_bbox':[box[0]/600,box[1]/300,box[2]/600,box[3]/300],
@@ -152,7 +153,7 @@ def test_axis_card_code_and_caption_are_owned_by_their_printed_tag(monkeypatch):
         for x, tag, code in ((100, '-AX1515N', 'CK3W_AX1515N'),
                              (320, '-AX2323N', 'CK3W_AX2323N')):
             page.insert_text((x, 100), tag, fontsize=8)
-            page.insert_text((x, 130), code, fontsize=8)
+            page.insert_text((x, 139), code, fontsize=8)
             page.insert_text((x+20, 170), 'V_FLAG0', fontsize=8)
             page.insert_text((x+40, 185), 'CH0', fontsize=8)
         info = PageInfo(1, 'MAIN_CIRCUIT', 'Main', width=600, height=300)
@@ -164,6 +165,10 @@ def test_axis_card_code_and_caption_are_owned_by_their_printed_tag(monkeypatch):
                 ('4轴模拟量轴卡','CK3W_AX2323N',False)]
     assert all(any(e.role == 'device_description' for e in by_tag[tag].evidences)
                for tag in ('-AX1515N','-AX2323N'))
+    for tag in ('-AX1515N','-AX2323N'):
+        notes=[e for e in by_tag[tag].evidences if e.role=='device_annotation']
+        assert any(e.raw_text=='S轴命令端口' for e in notes)
+        assert all(e.device_tag==tag for e in notes)
 
 
 def test_compound_module_code_is_one_model_and_io_labels_are_not_models():
@@ -216,3 +221,43 @@ def test_cross_page_contact_and_coil_share_one_device(monkeypatch):
     assert len(references) == 1
     assert references[0].cad_refs[0]["resolved"] is True
     assert not any(review.issue_type == "CROSS_REFERENCE_MISMATCH" for review in reviews)
+
+
+def test_contact_reference_below_terminals_links_to_same_page_column(monkeypatch):
+    monkeypatch.setattr(DualChannelOCREngine, "extract_dual_channel_spans", lambda page, spans, **kwargs: spans)
+    monkeypatch.setattr(VisionRecognizer, "analyze_vector_regions_on_page", lambda *args: [])
+    with pymupdf.open() as doc:
+        for _ in range(17):
+            doc.new_page(width=800, height=500)
+        page = doc[16]
+        for tag, y in (("-KA14", 150), ("-KA15", 215)):
+            page.insert_text((150, y), tag, fontsize=8)
+            page.insert_text((500, y), tag, fontsize=8)
+            page.insert_text((500, y + 28), "/17.1", fontsize=8)
+        info = PageInfo(17, "CONTROL_CIRCUIT", "Control", width=800, height=500, sheet_no="17")
+        devices, _ = extract_from_schematic_pdf(doc, [info], load_rules_config())
+
+    for tag in ("-KA14", "-KA15"):
+        device = next(item for item in devices if item.tag == tag)
+        references = [ev for ev in device.evidences if ev.role == "cross_reference"]
+        assert len(references) == 1
+        assert references[0].raw_text == "/17.1"
+        assert references[0].cad_refs[0]["target_pages"] == [17]
+        assert references[0].cad_refs[0]["resolved"] is True
+
+
+def test_recover_saved_contact_reference_without_reextracting_material(monkeypatch):
+    monkeypatch.setattr(DualChannelOCREngine, "extract_dual_channel_spans", lambda page, spans, **kwargs: spans)
+    with pymupdf.open() as doc:
+        page = doc.new_page(width=800, height=500)
+        page.insert_text((500, 150), "-KA14", fontsize=8)
+        page.insert_text((500, 178), "/1.1", fontsize=8)
+        tag = next(span for span in extract_visual_spans(page) if span['text'] == '-KA14')
+        evidence = EvidenceLocation(1, tag['bbox'], tag['norm_bbox'], raw_text='-KA14', role='contact_or_symbol')
+        item = BOMItem(id='ka14', seq_no=1, tag='-KA14', model='RXG12BD', quantity=1, evidences=[evidence])
+        result = SimpleNamespace(pages=[PageInfo(1, 'CONTROL_CIRCUIT', 'Control', sheet_no='1')],
+                                 itemized_bom=[item], filtered_items=[])
+        assert recover_cross_reference_evidence(doc, result, 1) == 1
+        assert recover_cross_reference_evidence(doc, result, 1) == 0
+    assert item.model == 'RXG12BD' and item.quantity == 1
+    assert [ev.raw_text for ev in item.evidences if ev.role == 'cross_reference'] == ['/1.1']

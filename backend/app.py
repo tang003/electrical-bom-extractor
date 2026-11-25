@@ -12,6 +12,7 @@ import shutil
 import time
 import threading
 import tempfile
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Literal, Annotated
@@ -33,6 +34,7 @@ from bom_extractor.rules import build_aggregated_from_itemized, load_rules_confi
 from bom_extractor.exporter import export_to_excel, export_to_json
 from bom_extractor.evaluator import evaluate_extraction
 from bom_extractor.vision import VisionRecognizer
+from bom_extractor.credentials import read_qwen_api_key, write_qwen_api_key
 from bom_extractor.som_renderer import SoMVisualPromptBuilder
 from bom_extractor.yolo_evolver import YOLOSelfEvolver
 from bom_extractor.classifier import extract_visual_spans
@@ -41,12 +43,17 @@ from bom_extractor.schematic_extractor import (
     COMPONENT_TAG_RE,
     MODEL_TOKEN_RE,
     _infer_component_name_and_brand,
+    recover_cross_reference_evidence,
 )
+from bom_extractor.page_references import INDEX_VERSION as PAGE_REFERENCE_VERSION, build_page_reference_index
 from bom_extractor.topology_graph import VectorTopologyBuilder
 from bom_extractor.notation import qualify_tag, extract_model_strings
 from bom_extractor.quality import extraction_quality, quality_message
 from bom_extractor.device_inventory import build_device_inventory
 from bom_extractor.ai_agent import preserve_human_state, save_json
+from bom_extractor.field_classifier import (QWEN_MODEL, VERSION as FIELD_CLASSIFIER_VERSION, build_context, request_qwen,
+                                             analysis_fingerprint, decision_summary, preview_images,
+                                             test_qwen_connection)
 from bom_extractor.independent import analysis_source, independent_policy, legacy_table_project, schematic_pages
 from bom_extractor.reconciliation import norm, reconcile, tag_key
 from bom_extractor.table_workflow import table_policy,TABLE_MODE,CHECK_MODE
@@ -338,6 +345,36 @@ def get_project(project_id: str) -> Dict[str, Any]:
     return _serialize_project_response(project_id)
 
 
+@app.get('/api/projects/{project_id}/page-references')
+def get_page_references(project_id: str) -> Dict[str, Any]:
+    """Build a versioned navigation index without changing BOM or review state."""
+    with store.lock:
+        result = store.results.get(project_id)
+        source_path = store.pdf_paths.get(project_id)
+        if result is None or source_path is None:
+            raise HTTPException(404, detail='项目或原图不存在')
+        pages = copy.deepcopy(result.pages)
+        source = analysis_source(result, source_path, OUTPUT_DIR / project_id)
+    metadata = [(page.page_num, page.sheet_no,
+                 page.extraction_diagnostics.get('drawing_grid_columns', [])) for page in pages]
+    signature = hashlib.sha256(json.dumps({
+        'version': PAGE_REFERENCE_VERSION, 'pdf': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'pages': metadata}, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+    cache_path = OUTPUT_DIR / project_id / 'page_reference_index.json'
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding='utf-8'))
+            if cached.get('signature') == signature:
+                return {'project_id': project_id, 'version': PAGE_REFERENCE_VERSION,
+                        'links': cached['links'], 'cache_hit': True}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    with pymupdf.open(source) as doc:
+        index = build_page_reference_index(doc, pages)
+    save_json(cache_path, {'signature': signature, **index})
+    return {'project_id': project_id, **index, 'cache_hit': False}
+
+
 @app.get("/api/projects/{project_id}/device-inventory")
 def get_device_inventory(project_id: str, family: Optional[str] = None) -> Dict[str, Any]:
     if family is not None and not re.fullmatch(r'[A-Za-z]{1,5}',family):
@@ -530,6 +567,26 @@ def reextract_project(project_id: str) -> Dict[str, Any]:
     store.sync_and_persist(project_id)
     _auto_start_ai(project_id)
     return _serialize_project_response(project_id)
+
+
+@app.post('/api/projects/{project_id}/cross-references/refresh')
+@serialized_mutation
+def refresh_cross_references(project_id: str, page_num: Optional[int] = None) -> Dict[str, Any]:
+    if project_id not in store.results or project_id not in store.pdf_paths:
+        raise HTTPException(404, detail='项目或原图不存在')
+    if any(pid == project_id and job['status'] in ('queued', 'running', 'reviewing', 'merging')
+           for (pid, _), job in ai_jobs.jobs.items()):
+        raise HTTPException(409, detail='整图 AI 正在运行，请任务结束后再补充跨位置引用')
+    result = store.results[project_id]
+    source = analysis_source(result, store.pdf_paths[project_id], OUTPUT_DIR / project_id)
+    try:
+        with pymupdf.open(source) as doc:
+            added = recover_cross_reference_evidence(doc, result, page_num)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    if added:
+        store.sync_and_persist(project_id, rebuild_aggregated=False)
+    return {'added': added, 'page_num': page_num}
 
 
 def _build_independent_project(project_id,workflow_mode=CHECK_MODE,table_pages=None):
@@ -1177,6 +1234,8 @@ def handle_review_action(project_id: str, review_id: str, payload: ReviewActionP
         if len(legacy) == 1:
             rev.proposed_data["added_item_id"] = legacy[0].id
 
+    brand_only_acceptance = (rev.issue_type == 'AI_FIELD_CLASSIFICATION' and
+                             bool((rev.proposed_data or {}).get('ai_brand_candidate_only')))
     if payload.action == "ACCEPT":
         if rev.status != "ACCEPTED" and rev.proposed_data:
             pdata = rev.proposed_data
@@ -1219,20 +1278,63 @@ def handle_review_action(project_id: str, review_id: str, payload: ReviewActionP
                 target_id = pdata.get("target_id")
                 seq = pdata.get("target_seq_no")
                 tag = pdata.get("target_tag") or rev.tag
-                targets = ([it for it in res.itemized_bom if it.id==target_id] if target_id else
+                candidates = res.itemized_bom + (res.filtered_items if rev.issue_type == 'AI_FIELD_CLASSIFICATION' else [])
+                targets = ([it for it in candidates if it.id==target_id] if target_id else
                            [it for it in res.itemized_bom if it.seq_no == seq] if seq is not None else
                            [it for it in res.itemized_bom if tag in (it.tags or [it.tag])])
                 if len(targets) != 1:
                     raise HTTPException(status_code=409, detail="审核项未唯一关联到明细物料，请在位号明细中核实主件和附件")
                 target = targets[0]
+                brand_only_acceptance = (rev.issue_type == 'AI_FIELD_CLASSIFICATION' and
+                                         bool(pdata.get('ai_brand_candidate_only')))
+                if rev.issue_type == 'AI_FIELD_CLASSIFICATION':
+                    for field, expected in pdata.get('expected_values', {}).items():
+                        if field not in ('name', 'model', 'specification', 'brand') or getattr(target, field) != expected:
+                            raise HTTPException(409, detail='AI 判读后物料已变化，请重新判读再采纳')
                 for field in ("brand", "model", "name", "unit"):
                     if field in pdata:
                         setattr(target, field, pdata[field])
+                if rev.issue_type == 'AI_FIELD_CLASSIFICATION':
+                    if 'specification' in pdata:
+                        target.specification = pdata['specification']
+                    if 'model' in pdata:
+                        target.raw_model = pdata['model']
+                        target.model_origin = 'ai_field_review_confirmed'
+                    for assignment in pdata.get('assignments', []):
+                        role = assignment['role']
+                        if role not in ('model', 'rating', 'material_name', 'circuit_purpose', 'drawing_note'):
+                            continue
+                        text, box = assignment['text'], assignment['norm_bbox']
+                        evidence_page = assignment.get('page', rev.page)
+                        evidence_role = {'model':'model_text', 'rating':'specification',
+                                         'material_name':'device_description',
+                                         'circuit_purpose':'device_annotation',
+                                         'drawing_note':'device_annotation'}[role]
+                        existing = [ev for ev in target.evidences if ev.page == evidence_page and
+                                    ev.raw_text.strip() == text.strip() and
+                                    all(abs(a-b) < .003 for a,b in zip(ev.norm_bbox, box))]
+                        if existing:
+                            for ev in existing:
+                                if ev.role in ('model_text','model_candidate','device_description','device_annotation','specification'):
+                                    ev.role = evidence_role
+                        else:
+                            target.evidences.append(EvidenceLocation(evidence_page, _point_bbox(res, evidence_page, box),
+                                                                     box, raw_text=text, role=evidence_role,
+                                                                     device_tag=target.tag))
+                    if brand_only_acceptance:
+                        target.review_note = '工程师已核对并采纳图形商标品牌候选；型号与其他采购信息仍待核实。'
+                    else:
+                        conflict = next((other for other in res.review_items if other.id == f'rev_conflict_{target.tag}'
+                                         and other.issue_type == 'PARAM_MISMATCH' and other.status == 'PENDING'), None)
+                        if conflict:
+                            conflict.status = 'ACCEPTED'
+                        target.review_note = '工程师已采纳千问的逐行文字归属判读；原文与位置证据已保留。'
                 target.source_type = SourceType.MANUAL_EDITED.value
-                target.needs_review = False
+                if not brand_only_acceptance:
+                    target.needs_review = False
         rev.status = "ACCEPTED"
         confirmed_tags = {t.strip() for t in re.split(r"[,，]", rev.tag) if t.strip()}
-        for it in res.itemized_bom:
+        for it in ([] if brand_only_acceptance else res.itemized_bom):
             tags = set(it.tags or [it.tag])
             if tags.intersection(confirmed_tags) and not any(other.status == "PENDING" and tags.intersection(t.strip() for t in re.split(r"[,，]", other.tag)) for other in res.review_items):
                 it.needs_review = False
@@ -1311,6 +1413,227 @@ def update_vlm_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "ok", "config": saved}
+
+
+class QwenKeyPayload(BaseModel):
+    api_key: str = Field(min_length=8, max_length=512)
+
+
+@app.get('/api/qwen-config')
+def get_qwen_config() -> Dict[str, Any]:
+    env_key = bool(os.environ.get('DASHSCOPE_API_KEY'))
+    saved_key = bool(read_qwen_api_key())
+    return {'model':QWEN_MODEL,'has_api_key':env_key or saved_key,
+            'key_source':'environment' if env_key else 'saved' if saved_key else 'none'}
+
+
+@app.put('/api/qwen-config')
+def update_qwen_config(payload: QwenKeyPayload) -> Dict[str, Any]:
+    write_qwen_api_key(payload.api_key.strip())
+    return get_qwen_config()
+
+
+class QwenTestPayload(BaseModel):
+    api_key: Optional[str] = None
+
+
+@app.post('/api/qwen-config/test')
+def check_qwen_config(payload: QwenTestPayload) -> Dict[str, Any]:
+    try:
+        return test_qwen_connection(api_key=payload.api_key.strip() if payload.api_key else None)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, detail=str(exc)) from exc
+
+
+def _field_reference_links(project_id: str) -> List[Dict[str, Any]]:
+    path = OUTPUT_DIR / project_id / 'page_reference_index.json'
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, list) else data.get('links', [])
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+@app.get('/api/projects/{project_id}/bom/items/{item_id}/classify-text/preview')
+def preview_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
+    """Show the exact pixels the next single-item request would submit."""
+    with store.lock:
+        res = store.results.get(project_id)
+        if not res or project_id not in store.pdf_paths:
+            raise HTTPException(404, detail='项目或原图不存在')
+        item = next((it for it in res.itemized_bom + res.filtered_items if it.id == item_id), None)
+        if not item or item.is_quantity_adjustment or not item.tag:
+            raise HTTPException(404, detail='该位号没有可判读的物料明细')
+        source = analysis_source(res, store.pdf_paths[project_id], OUTPUT_DIR / project_id)
+        page_num = next((ev.page for ev in item.evidences if ev.role in ('main_circuit', 'coil', 'device')),
+                        item.primary_page)
+        if not 1 <= page_num <= res.page_count or page_num not in schematic_pages(res):
+            raise HTTPException(409, detail='该物料缺少有效的原理图页面')
+        item_copy = copy.deepcopy(item)
+        neighbors = copy.deepcopy(res.itemized_bom + res.filtered_items)
+        page_infos = copy.deepcopy(res.pages)
+        references = _field_reference_links(project_id)
+    try:
+        with pymupdf.open(source) as doc:
+            context = build_context(doc[page_num - 1], item_copy, page_num, neighbors,
+                                    doc, page_infos, references)
+            return {'tag': item.tag, 'page': context['page'], 'crop_mode': context['crop_mode'],
+                    'selection_status': context['selection_status'],
+                    'reference_links': context['reference_links'],
+                    'images': preview_images(context, doc[context['page'] - 1], doc),
+                    'included_texts': [f"P{span['page']} · {span['text']}" for span in context['text_spans']]}
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+
+
+@app.get('/api/projects/{project_id}/bom/items/{item_id}/classify-text/history')
+def item_text_history(project_id: str, item_id: str) -> Dict[str, Any]:
+    """Read saved single-device results, including caches from older prompt versions."""
+    with store.lock:
+        result = store.results.get(project_id)
+        if not result:
+            raise HTTPException(404, detail='项目不存在')
+        item = next((row for row in result.itemized_bom + result.filtered_items if row.id == item_id), None)
+        if not item:
+            raise HTTPException(404, detail='物料不存在')
+        tag = item.tag
+        page_num = next((ev.page for ev in item.evidences if ev.role in ('main_circuit', 'coil', 'device')),
+                        item.primary_page)
+        ambiguous_legacy = sum(row.tag == tag and next(
+            (ev.page for ev in row.evidences if ev.role in ('main_circuit', 'coil', 'device')),
+            row.primary_page) == page_num for row in result.itemized_bom + result.filtered_items) > 1
+        reviews = {review.id: review for review in result.review_items
+                   if review.issue_type == 'AI_FIELD_CLASSIFICATION'}
+    records = []
+    cache_dir = OUTPUT_DIR / project_id / 'ai_field_cache'
+    for path in cache_dir.glob('*.json'):
+        try:
+            cached = json.loads(path.read_text(encoding='utf-8'))
+            summary = cached['summary']
+            if summary.get('tag') != tag or (not cached.get('item_id') and summary.get('page') != page_num):
+                continue
+            if cached.get('item_id') and cached['item_id'] != item_id:
+                continue
+            review_id = 'rev_ai_fields_' + path.stem[:20]
+            review = reviews.get(review_id)
+            if not cached.get('item_id') and ambiguous_legacy and not (
+                    review and (review.proposed_data or {}).get('target_id') == item_id):
+                continue
+            if review and (review.tag != tag or (not cached.get('item_id') and review.page != page_num) or
+                           (review.proposed_data or {}).get('target_id', item_id) != item_id):
+                continue
+            records.append({'id': path.stem, 'item_id': item_id, 'review_id': review_id,
+                            'review_status': review.status if review else 'UNLINKED',
+                            'created_at': cached.get('created_at') or datetime.fromtimestamp(
+                                path.stat().st_mtime, timezone.utc).isoformat(),
+                            'analysis': summary, 'model': cached.get('model', QWEN_MODEL),
+                            'usage': cached.get('usage', {}),
+                            'legacy': cached.get('version') != FIELD_CLASSIFIER_VERSION})
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    records.sort(key=lambda row: row['created_at'], reverse=True)
+    return {'item_id': item_id, 'records': records[:100]}
+
+
+@app.post("/api/projects/{project_id}/bom/items/{item_id}/classify-text")
+def classify_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
+    """Ask Qwen about one device; save a review proposal, never silently rewrite the BOM."""
+    with store.lock:
+        res = store.results.get(project_id)
+        if not res or project_id not in store.pdf_paths:
+            raise HTTPException(404, detail="项目或原图不存在")
+        item = next((it for it in res.itemized_bom + res.filtered_items if it.id == item_id), None)
+        if not item or item.is_quantity_adjustment or not item.tag:
+            raise HTTPException(404, detail="该位号没有可判读的物料明细")
+        if any(pid == project_id and job['status'] in ('queued','running','reviewing','merging')
+               for (pid,_),job in ai_jobs.jobs.items()):
+            raise HTTPException(409, detail="整图 AI 正在合并，请任务结束后再判读单个位号")
+        source = analysis_source(res, store.pdf_paths[project_id], OUTPUT_DIR/project_id)
+        page_num = next((ev.page for ev in item.evidences if ev.role in ('main_circuit','coil','device')),
+                        item.primary_page)
+        if not 1 <= page_num <= res.page_count or page_num not in schematic_pages(res):
+            raise HTTPException(409, detail="该物料缺少有效的原理图页面")
+        snapshot = {field:getattr(item,field) for field in ('name','model','specification','brand')}
+        item_copy = copy.deepcopy(item)
+        neighbors = copy.deepcopy(res.itemized_bom + res.filtered_items)
+        page_infos = copy.deepcopy(res.pages)
+        references = _field_reference_links(project_id)
+    try:
+        with pymupdf.open(source) as doc:
+            page = doc[page_num-1]
+            context = build_context(page, item_copy, page_num, neighbors, doc, page_infos, references)
+            fingerprint = analysis_fingerprint(source, context)
+            cache_path = OUTPUT_DIR/project_id/'ai_field_cache'/(fingerprint+'.json')
+            if cache_path.is_file():
+                cached = json.loads(cache_path.read_text(encoding='utf-8'))
+                summary, usage, cache_hit = cached['summary'], cached.get('usage', {}), True
+            else:
+                fields, usage = request_qwen(context, doc[context['page']-1], doc)
+                summary = decision_summary(fields, context)
+                save_json(cache_path, {'summary':summary,'usage':usage,'model':QWEN_MODEL,
+                                       'item_id':item_id,'version':FIELD_CLASSIFIER_VERSION,
+                                       'created_at':datetime.now(timezone.utc).isoformat()})
+                cache_hit = False
+            summary['can_propose_brand'] = bool(summary.get('visual_brand_candidate') and not summary.get('brand')
+                                                and context.get('selection_status') != 'ambiguous')
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, detail=str(exc)) from exc
+    with store.lock:
+        res = store.results.get(project_id)
+        target = next((it for it in res.itemized_bom + res.filtered_items if it.id == item_id), None) if res else None
+        if not target or any(getattr(target,field) != value for field,value in snapshot.items()):
+            raise HTTPException(409, detail="判读期间物料已变动，请重新运行")
+        review_id = 'rev_ai_fields_' + fingerprint[:20]
+        review = next((r for r in res.review_items if r.id == review_id), None)
+        proposal = None
+        if summary['can_propose_update'] or summary['can_propose_brand']:
+            brand_only = not summary['can_propose_update']
+            proposal = {'target_id':target.id,'expected_values':snapshot,
+                        'ai_brand_candidate_only':brand_only}
+            if not brand_only:
+                proposal.update({'model':summary['model'], 'assignments':[
+                    entry for entry in summary['assignments'] if
+                    re.sub(r'\s+', '', (entry.get('owner_tag') or '')).upper() ==
+                    re.sub(r'\s+', '', target.tag).upper()],
+                    'name_source':summary['name_source']})
+                for field in ('name','specification'):
+                    if summary.get(field): proposal[field] = summary[field]
+            if summary.get('brand') or summary.get('visual_brand_candidate'):
+                proposal['brand'] = summary.get('brand') or summary['visual_brand_candidate']
+        description = (f"建议型号 {summary['model'] or '未确定'}；"
+                       f"名称 {summary['name'] or '未确定'}；"
+                       f"品牌 {summary['brand'] or summary['visual_brand_candidate'] or '未确定'}"
+                       f"{'（图形候选）' if summary['visual_brand_candidate'] and not summary['brand'] else ''}；"
+                       f"规格 {summary['specification'] or '未确定'}；"
+                       f"已读端子 {'、'.join(summary['terminal_marks'][:16]) or '无'}。{summary['reason']}")
+        suggestion = ('图形商标仅为 AI 候选；核对原图后可单独采纳品牌，型号仍待核。'
+                      if proposal and proposal.get('ai_brand_candidate_only') else
+                      '逐项查看原文及坐标，再决定是否采纳。AI 未修改采购数量。')
+        if not review:
+            review = ReviewItem(id=review_id,severity='WARNING',issue_type='AI_FIELD_CLASSIFICATION',
+                tag=target.tag,title=f'千问逐行判读：{target.tag}',
+                description=description,
+                suggestion=suggestion,
+                page=context['page'],norm_bbox=context['anchor_box'],
+                action_type='UPDATE_ITEM' if proposal else 'CONFIRM',proposed_data=proposal)
+            res.review_items.append(review)
+            store.sync_and_persist(project_id)
+        elif review.status == 'PENDING' and (review.action_type != ('UPDATE_ITEM' if proposal else 'CONFIRM')
+                                             or review.proposed_data != proposal):
+            review.action_type = 'UPDATE_ITEM' if proposal else 'CONFIRM'
+            review.proposed_data = proposal
+            review.description = description
+            review.suggestion = suggestion
+            store.sync_and_persist(project_id)
+        return {'review_id':review.id,'review_status':review.status,'analysis':summary,
+                'model':QWEN_MODEL,'cache_hit':cache_hit,'usage':usage,
+                'crop_mode':context.get('crop_mode', 'legacy_context')}
 
 
 class AIExtractionPayload(BaseModel):
@@ -1459,6 +1782,8 @@ def get_page_topology(project_id: str, page_num: int, view: Literal['original','
         page = doc[page_num - 1]
         options=_som_reference_options(store.results[project_id],page_num) if view=='original' else {}
         topo = SoMVisualPromptBuilder.render_som_annotated_page(page, som_png, dpi=180,**options)
+        if view=='original':
+            _add_known_terminal_label_candidates(topo,page,store.results[project_id],page_num)
         return topo
     finally:
         doc.close()
@@ -1470,6 +1795,53 @@ def _som_reference_options(result,page_num):
     if not rows and result.extraction_mode=='PART_LIST_MODE':
         rows=[row for row in result.itemized_bom if any(e.page==page_num and e.role=='table_row' for e in row.evidences)]
     return {'reference_rows':rows,'whole_table':bool(info and info.page_type=='PART_LIST')}
+
+
+def _add_known_terminal_label_candidates(topo,page,result,page_num):
+    """Add literal bare X labels only when this page already has that terminal strip's symbols."""
+    known={}
+    for item in result.itemized_bom:
+        if item.entity_role!='terminal' or not item.terminal_strip_tag:
+            continue
+        local=re.search(r'-X\d+[A-Z]?$',item.terminal_strip_tag.upper())
+        if not local:
+            continue
+        symbols=[e.norm_bbox for e in item.evidences if e.page==page_num and e.role=='terminal_symbol' and e.norm_bbox]
+        if not symbols:
+            continue
+        full=item.terminal_strip_tag.upper()
+        entry=known.setdefault(local.group(),{})
+        entry.setdefault(full,[]).extend(symbols)
+    next_id=max((int(c.get('som_id') or 0) for c in topo.get('candidates',[])+topo.get('excluded_candidates',[])),default=0)+1
+    for span in extract_visual_spans(page):
+        printed=span['text'].strip().upper().replace('−','-')
+        if not re.fullmatch(r'-?X\d+[A-Z]?',printed):
+            continue
+        local=printed if printed.startswith('-') else '-'+printed
+        owners=known.get(local,{})
+        if len(owners)!=1:
+            continue
+        full,symbols=next(iter(owners.items()))
+        box=span['norm_bbox']
+        cx,cy=(box[0]+box[2])/2,(box[1]+box[3])/2
+        if not any(abs((symbol[0]+symbol[2])/2-cx)<.06 and abs((symbol[1]+symbol[3])/2-cy)<.04 for symbol in symbols):
+            continue
+        def same_anchor(candidate):
+            candidate_local=re.search(r'-X\d+[A-Z]?$',str(candidate.get('tag','')).upper())
+            if not candidate_local or candidate_local.group()!=local:
+                return False
+            anchor=candidate.get('anchor_norm_bbox') or candidate.get('norm_bbox')
+            return bool(anchor and abs((anchor[0]+anchor[2])/2-cx)<.02 and abs((anchor[1]+anchor[3])/2-cy)<.02)
+        if any(same_anchor(candidate) for candidate in topo.get('candidates',[])):
+            continue
+        topo.setdefault('candidates',[]).append({
+            'som_id':next_id,'som_label':f'#{next_id}','tag':full,
+            'anchor_source_text':span['text'],'nearby_texts':[span['text']],
+            'norm_bbox':box,'anchor_norm_bbox':box,'bbox':span['bbox'],
+            'bbox_source':'native_terminal_tag','detector_source':'KNOWN_TERMINAL_LABEL',
+            'yolo_class_id':9,'yolo_class':'terminal_other','excluded':False,
+        })
+        next_id+=1
 
 
 @app.get("/api/yolo-dataset")

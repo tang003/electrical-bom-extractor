@@ -1,6 +1,7 @@
 """Candidate exclusions remain inspectable and never hide normal device anchors."""
 import pymupdf
 import pytest
+from types import SimpleNamespace
 
 from bom_extractor.classifier import extract_visual_spans
 from bom_extractor.topology_graph import VectorTopologyBuilder
@@ -93,3 +94,23 @@ def test_unnumbered_native_lamp_owns_its_model_instead_of_nearby_fuse():
         assert bound['-WL'][0]['model_text']=='XA2EVQ1LC'
         assert '-FU1' not in bound
         assert next(s for s in anchors if s['tag']=='-WL')['unindexed_tag']
+
+
+def test_known_bare_terminal_labels_get_literal_boxes_without_legend_false_positives():
+    from backend.app import _add_known_terminal_label_candidates
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=600,height=400)
+        for x,y in [(80,100),(80,240),(500,350)]:
+            page.insert_text((x,y),'X7',fontsize=10)
+        symbols=[SimpleNamespace(page=1,role='terminal_symbol',norm_bbox=box) for box in
+                 ([.17,.23,.18,.25],[.17,.58,.18,.60])]
+        item=SimpleNamespace(entity_role='terminal',terminal_strip_tag='-X7',evidences=symbols)
+        result=SimpleNamespace(itemized_bom=[item])
+        topo={'candidates':[],'excluded_candidates':[]}
+        _add_known_terminal_label_candidates(topo,page,result,1)
+        assert len(topo['candidates'])==2
+        assert {candidate['tag'] for candidate in topo['candidates']}=={'-X7'}
+        assert all(candidate['detector_source']=='KNOWN_TERMINAL_LABEL' for candidate in topo['candidates'])
+        before=topo['candidates'][:]
+        _add_known_terminal_label_candidates(topo,page,result,1)
+        assert topo['candidates']==before
