@@ -1,0 +1,11 @@
+services:
+  bom:
+    networks:
+      gateway:
+        aliases:
+          - electrical-bom
+
+networks:
+  gateway:
+    external: true
+    name: "${BOM_PROXY_NETWORK:?Set BOM_PROXY_NETWORK}"

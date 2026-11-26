@@ -82,7 +82,9 @@ app = FastAPI(
     version="1.0.0",
 )
 
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+_allowed_hosts = ["127.0.0.1", "localhost", "[::1]", "testserver", "bom", "electrical-bom"]
+_allowed_hosts.extend(host.strip() for host in os.environ.get('ELECTRICAL_BOM_ALLOWED_HOSTS', '').split(',') if host.strip())
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(dict.fromkeys(_allowed_hosts)))
 
 @app.middleware("http")
 async def add_no_cache_header(request: Request, call_next):
@@ -408,6 +410,11 @@ def index_page(request: Request) -> HTMLResponse:
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
+
+@app.get('/healthz')
+def healthz() -> Dict[str, str]:
+    return {'status': 'ok'}
 
 
 @app.get('/login',response_class=HTMLResponse)
@@ -1671,7 +1678,10 @@ def get_qwen_config() -> Dict[str, Any]:
 
 @app.put('/api/qwen-config')
 def update_qwen_config(payload: QwenKeyPayload) -> Dict[str, Any]:
-    write_qwen_api_key(payload.api_key.strip())
+    try:
+        write_qwen_api_key(payload.api_key.strip())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return get_qwen_config()
 
 

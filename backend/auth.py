@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError
 import psycopg
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -22,6 +22,25 @@ SESSION_SECONDS = 30 * 24 * 3600
 
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def verify_password_hash(encoded: str, password: str) -> bool:
+    """Accept the previous server's PBKDF2 hash once, then upgrade on login."""
+    if encoded.startswith('pbkdf2_sha256$'):
+        try:
+            algorithm, rounds_text, salt_text, expected_text = encoded.split('$')
+            rounds = int(rounds_text)
+            salt, expected = bytes.fromhex(salt_text), bytes.fromhex(expected_text)
+            if algorithm != 'pbkdf2_sha256' or not 600_000 <= rounds <= 2_000_000 or len(salt) != 32 or len(expected) != 32:
+                return False
+            actual = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, rounds)
+            return secrets.compare_digest(actual, expected)
+        except (TypeError, ValueError, UnicodeError):
+            return False
+    try:
+        return bool(ph.verify(encoded, password))
+    except (VerificationError, InvalidHashError, TypeError, ValueError):
+        return False
 
 
 class Login(BaseModel):
@@ -84,13 +103,13 @@ def create_auth_router(repo, *, secure_cookies=False):
         if len(attempts)>=8: raise HTTPException(429,'登录尝试过多，请稍后再试')
         with repo.connection() as conn:
             user=conn.execute('SELECT * FROM users WHERE username=%s',(payload.username,)).fetchone()
-            try:
-                valid=bool(user and user['active'] and ph.verify(user['password_hash'],payload.password))
-            except (VerifyMismatchError,ValueError): valid=False
+            valid=bool(user and user['active'] and verify_password_hash(user['password_hash'],payload.password))
             if not valid:
                 attempts.append(now);service.attempts[key]=attempts
                 raise HTTPException(401,'账号或密码错误')
             service.attempts.pop(key,None)
+            if user['password_hash'].startswith('pbkdf2_sha256$'):
+                conn.execute('UPDATE users SET password_hash=%s,updated_at=now() WHERE id=%s',(ph.hash(payload.password),user['id']))
             token=secrets.token_urlsafe(48);csrf=secrets.token_urlsafe(32)
             conn.execute("SELECT set_config('app.user_id',%s,true)",(str(user['id']),))
             conn.execute('INSERT INTO user_sessions(id,user_id,token_hash,csrf_hash,expires_at) VALUES(%s,%s,%s,%s,%s)',(uuid4(),user['id'],digest(token),digest(csrf),datetime.now(timezone.utc)+timedelta(seconds=SESSION_SECONDS)))
@@ -112,8 +131,7 @@ def create_auth_router(repo, *, secure_cookies=False):
         if payload.new_password==payload.old_password: raise HTTPException(400,'新密码不能与当前密码相同')
         with repo.connection(user['id']) as conn:
             row=conn.execute('SELECT password_hash FROM users WHERE id=%s',(user['id'],)).fetchone()
-            try: ph.verify(row['password_hash'],payload.old_password)
-            except VerifyMismatchError: raise HTTPException(400,'原密码错误')
+            if not verify_password_hash(row['password_hash'],payload.old_password): raise HTTPException(400,'原密码错误')
             conn.execute('UPDATE users SET password_hash=%s,must_change_password=false,updated_at=now() WHERE id=%s',(ph.hash(payload.new_password),user['id']))
             conn.execute('UPDATE user_sessions SET revoked_at=now() WHERE user_id=%s',(user['id'],))
             conn.execute('INSERT INTO audit_events(actor_id,action,request_id,summary) VALUES(%s,%s,%s,%s)',(user['id'],'password_change',request_id.get(),'修改密码'))

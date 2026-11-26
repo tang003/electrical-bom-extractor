@@ -1,0 +1,67 @@
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bom_admin
+      POSTGRES_PASSWORD: "${BOM_PG_ADMIN_PASSWORD:?Set BOM_PG_ADMIN_PASSWORD}"
+      POSTGRES_DB: bom_workbench
+    volumes:
+      - bom_pg_data:/var/lib/postgresql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bom_admin -d bom_workbench"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  bom:
+    image: "electrical-bom:${BOM_IMAGE_TAG:?Set BOM_IMAGE_TAG}"
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    cpus: "${BOM_CPUS:-1.5}"
+    mem_limit: "${BOM_MEMORY_LIMIT:-2g}"
+    pids_limit: 256
+    ports:
+      - "${BOM_BIND_ADDRESS:-127.0.0.1}:${BOM_PORT:-8000}:8000"
+    environment:
+      ELECTRICAL_BOM_SERVER_MODE: "1"
+      ELECTRICAL_BOM_ALLOWED_HOSTS: "${BOM_ALLOWED_HOSTS:-localhost,127.0.0.1,bom}"
+      ELECTRICAL_BOM_VLM_CONFIG: /data/config/vlm_config.json
+      ELECTRICAL_BOM_OUTPUT_DIR: /data/projects
+      BOM_DATABASE_URL: "${BOM_DATABASE_URL:?Set BOM_DATABASE_URL}"
+      BOM_COOKIE_SECURE: "${BOM_COOKIE_SECURE:-1}"
+      VLM_API_KEY: "${VLM_API_KEY:-}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:-}"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      FORWARDED_ALLOW_IPS: "${BOM_TRUSTED_PROXY_IPS:-127.0.0.1}"
+    volumes:
+      - "${BOM_DATA_DIR:?Set BOM_DATA_DIR}:/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+
+networks:
+  backend:
+
+volumes:
+  bom_pg_data:

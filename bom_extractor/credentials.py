@@ -41,6 +41,8 @@ def _read_key(path: Path) -> str:
     if not path.exists():
         return ""
     saved = json.loads(path.read_text(encoding="utf-8"))
+    if os.environ.get('ELECTRICAL_BOM_SERVER_MODE') == '1' and saved.get('storage') != 'windows-dpapi':
+        return ""
     value = base64.b64decode(saved["value"])
     if saved["storage"] == "windows-dpapi":
         value = _dpapi(value, decrypt=True)
@@ -52,6 +54,8 @@ def write_api_key(key: str) -> None:
 
 
 def _write_key(path: Path, key: str) -> None:
+    if os.environ.get('ELECTRICAL_BOM_SERVER_MODE') == '1':
+        raise ValueError('生产服务密钥请通过服务器密钥配置注入，不能保存在本地文件')
     path.parent.mkdir(parents=True, exist_ok=True)
     value = key.encode("utf-8")
     storage = "windows-dpapi" if os.name == "nt" else "user-file"

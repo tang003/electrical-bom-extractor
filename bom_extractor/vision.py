@@ -26,7 +26,7 @@ class VisionRecognizer:
     3. Actor-Critic Dual-Model VLM/LLM pipeline (supports Qwen-VL-Max, GPT-4o, Gemini 2.5 Pro, Claude 3.7, DeepSeek-R1)
     """
 
-    CONFIG_FILE = Path(__file__).parent / "vlm_config.json"
+    CONFIG_FILE = Path(os.environ.get('ELECTRICAL_BOM_VLM_CONFIG') or Path(__file__).parent / "vlm_config.json")
 
     def __init__(
         self,
