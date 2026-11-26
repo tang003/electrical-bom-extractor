@@ -8,12 +8,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 from psycopg import sql
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from backend.pg_store import PgRepository
 
 
@@ -46,10 +48,15 @@ def migrate(data_dir: Path, expected_projects: int | None = None) -> int:
         else:
             admin_id = row[0]
     migrated = admin_repo.migrate_legacy(data_dir / 'projects', admin_id)
-    with psycopg.connect(app_url) as conn:
+    with psycopg.connect(admin_url) as conn:
         count = conn.execute('SELECT count(*) FROM projects').fetchone()[0]
     if count != len(source_states):
         raise RuntimeError(f'数据库项目数 {count} 与旧版项目数 {len(source_states)} 不一致')
+    with psycopg.connect(app_url) as conn:
+        conn.execute("SELECT set_config('app.user_id', %s, true)", (str(admin_id),))
+        visible_count = conn.execute('SELECT count(*) FROM projects').fetchone()[0]
+    if visible_count != count:
+        raise RuntimeError('应用账号无法读取全部已迁移项目')
     print(f'Migrated {len(migrated)} projects; database now has {count} projects.')
     return count
 
