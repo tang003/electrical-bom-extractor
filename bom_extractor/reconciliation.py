@@ -164,8 +164,9 @@ def _split_accessory_rows(references, devices):
 
 
 def reconcile(result):
-    snapshot=result.independent_bom
-    references=result.declared_parts
+    from .material_scope import is_estimated_wire
+    snapshot=[i for i in result.independent_bom if not is_estimated_wire(i)]
+    references=[i for i in result.declared_parts if not is_estimated_wire(i)]
     previous={r['id']:r for r in result.reconciliation}
     index=defaultdict(list);local=defaultdict(set)
     for item in snapshot:

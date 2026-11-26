@@ -180,6 +180,21 @@ def _export_diagnostics_to_excel(result: ExtractionResult, output_path: Path | s
                            ev.raw_text,json.dumps(ev.norm_bbox),item.procurement_scope])
         _style_worksheet(ws);ws.freeze_panes='F2';ws.auto_filter.ref=ws.dimensions
 
+    if any(item.component_parts for item in result.itemized_bom):
+        from .components import PART_LABELS
+        ws_parts = wb.create_sheet('本体与部件')
+        ws_parts.append(['物料ID','所属位号','部件角色','名称','型号','参数','类型依据','采购关系','关系依据','确认状态',
+                         '独立采购行ID','数量','单位','证据页','原图文字','坐标'])
+        for item in result.itemized_bom:
+            for part in item.component_parts:
+                evidence = part.get('evidences', [])
+                ws_parts.append([item.id,part.get('owner_tag'),PART_LABELS.get(part['kind'],'部件'),part['name'],
+                    part.get('model'),part.get('specification'),part.get('kind_basis'),part.get('relationship'),part.get('relationship_basis'),
+                    part.get('status'),part.get('materialized_item_id'),part.get('quantity'),part.get('unit'),
+                    ', '.join(str(n) for n in sorted({ev['page'] for ev in evidence})),
+                    '；'.join(ev['raw_text'] for ev in evidence),json.dumps([ev['norm_bbox'] for ev in evidence])])
+        _style_worksheet(ws_parts);ws_parts.freeze_panes='E2';ws_parts.auto_filter.ref=ws_parts.dimensions
+
     # Sheet 3: 待人工审核与校验报告
     ws_rev = wb.create_sheet("待审核与校验报告")
     ws_rev.append(["审核ID", "级别", "异常类型", "涉及位号", "问题标题", "详细证据说明", "人工处理建议", "图纸页码", "归一化坐标(norm_bbox)", "状态"])
@@ -288,6 +303,9 @@ def _export_diagnostics_to_excel(result: ExtractionResult, output_path: Path | s
 
 
 def export_to_excel(result: ExtractionResult, output_path: Path | str, *, diagnostic: bool=False) -> str:
+    import copy
+    from .material_scope import exclude_estimated_wires
+    result = exclude_estimated_wires(copy.deepcopy(result))
     if diagnostic:return _export_diagnostics_to_excel(result,output_path)
     from .customer_excel import export_customer_excel
     return export_customer_excel(result,output_path)

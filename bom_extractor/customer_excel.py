@@ -11,6 +11,7 @@ from openpyxl.styles import Alignment,Border,Font,PatternFill,Side
 from openpyxl.worksheet.page import PageMargins
 
 from .table_workflow import table_policy
+from .components import model_state, components_pending, PART_LABELS
 
 HEADERS=['序号','物料名称','型号/规格','品牌','数量','单位','位号','来源图号/页码','备注']
 WIDTHS=[7,19,42,13,10,8,25,18,36]
@@ -39,7 +40,8 @@ def _unit_text(unit):
 
 def _flags(item,table_only):
     flags=[]
-    if not _known(item.model):flags.append(('型号待确认',3))
+    if not _known(item.model):flags.append(('型号关联待核' if model_state(item)['code']=='ASSOCIATION_PENDING' else '型号待确认',3))
+    if not table_only and components_pending(item):flags.append(('本体/附件待核',3))
     if item.quantity is None or (not table_only and item.quantity_status in {'unknown','needs_confirmation'}):flags.append(('数量待确认',5))
     if not table_only:
         if item.procurement_scope=='unknown':flags.append(('范围待确认',None))
@@ -88,6 +90,12 @@ def _pending_rows(result):
         pages=sorted({e['page'] for i in [*facts,*declared] for e in i.get('evidences',[])})
         add(['、'.join(tags[:4])+(f'等{len(tags)}项' if len(tags)>4 else ''),labels.get(r['status'],'供货范围待核'),_facts(facts),_facts(declared),
              '\n'.join(r.get('reasons',[])),'、'.join(f'P{p}' for p in pages)])
+    for item in result.itemized_bom:
+        if components_pending(item):
+            parts=[p for p in item.component_parts if p.get('status') != 'SUPERSEDED']
+            description='；'.join(f"{PART_LABELS.get(p['kind'],'部件')}：{p.get('model') or '型号未定'}" for p in parts)
+            add([item.tag or item.name,'本体/附件核对' if components_pending(item) else '部件组成记录',
+                 description,'','部件型号分别保留；附件采购关系与数量须核定，未自动增加采购行。',_page_label(item)])
     members={i.id:i for i in result.itemized_bom}
     for group in result.aggregated_bom:
         affected=[members[key] for key in group.member_ids if key in members and key not in covered]
@@ -203,6 +211,8 @@ def export_customer_excel(result,output_path):
         flags=_flags(item,table_only)
         if set(item.member_ids or [item.id]).intersection(conflicts):flags.append(('清单差异待核',7))
         notes=[item.remark] if item.remark else []
+        if item.component_parts:
+            notes.append('部件组成：'+'；'.join(f"{PART_LABELS.get(p['kind'],'部件')} {p.get('model') or '型号未定'}" for p in item.component_parts if p.get('status') != 'SUPERSEDED'))
         members=item.member_ids or [item.id]
         for key in members:
             if key in supply_by_id:

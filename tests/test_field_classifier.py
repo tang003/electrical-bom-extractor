@@ -65,6 +65,82 @@ def test_qwen_call_uses_two_crops_and_grounded_json():
     assert decision_summary(result,damaged)['assignments'][0]['text']=='CK3M电源'
 
 
+def test_qwen_corrects_invalid_evidence_once_and_accounts_for_both_requests():
+    calls=[]
+    wrong=_decision();wrong['assignments'][1]['role']='other'
+    def fake_request(url, **kwargs):
+        calls.append(copy.deepcopy(kwargs['json']))
+        answer=wrong if len(calls)==1 else _decision()
+        class Response:
+            ok=True
+            def json(self):
+                return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(answer)}}],
+                        'usage':{'prompt_tokens':1200,'completion_tokens':200,'total_tokens':1400}}
+        return Response()
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=600,height=400)
+        result,usage=request_qwen(_context(),page,api_key='test-key',request=fake_request)
+    assert result.model_raw=='iC65N-C10A/2P' and len(calls)==2
+    assert len(calls[0]['messages'])==1 and len(calls[1]['messages'])==3
+    assert 'assignments 必须为 model' in calls[1]['messages'][-1]['content']
+    assert usage['prompt_tokens']==2400 and usage['total_tokens']==2800
+    assert usage['validation_retries']==1
+
+
+def test_qwen_stops_after_one_correction_if_evidence_is_still_invalid():
+    calls=[];wrong=_decision();wrong['model_raw']='INVENTED-9'
+    def fake_request(url, **kwargs):
+        calls.append(kwargs['json'])
+        class Response:
+            ok=True
+            def json(self):
+                return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(wrong)}}]}
+        return Response()
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=600,height=400)
+        with pytest.raises(ValueError,match='自动校正后仍未通过原文校验'):
+            request_qwen(_context(),page,api_key='test-key',request=fake_request)
+    assert len(calls)==2
+
+
+def test_qwen_does_not_retry_service_errors():
+    calls=[]
+    def fake_request(url, **kwargs):
+        calls.append(kwargs['json'])
+        class Response:ok=False;status_code=429
+        return Response()
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=600,height=400)
+        with pytest.raises(RuntimeError,match='HTTP 429'):
+            request_qwen(_context(),page,api_key='test-key',request=fake_request)
+    assert len(calls)==1
+
+
+def test_field_citation_schema_excludes_reference_page_context_and_neighbor_spans():
+    context=_context()
+    context['text_spans'] += [
+        {'id':90,'text':'OTHER-1','norm_bbox':[.08,.30,.28,.33],'page':2,'image_role':'reference'},
+        {'id':91,'text':'OTHER-2','norm_bbox':[.32,.30,.38,.33],'page':1},
+        {'id':92,'text':'OTHER-3','norm_bbox':[.07,.18,.09,.20],'page':1}]
+    context['neighbor_tags']=[{'tag':'-F2','page':1,'box':[.06,.17,.10,.21]}]
+    def fake_request(url, **kwargs):
+        schema=kwargs['json']['response_format']['json_schema']['schema']
+        assert schema['$defs']['TextAssignment']['properties']['span_id']['enum']==[1,2,3,90,91,92]
+        for name in ('model_span_ids','specification_span_ids','brand_span_ids','material_name_span_ids'):
+            assert schema['properties'][name]['items']['enum']==[1,2,3]
+        for name in ('model_span_ids','specification_span_ids','kind_span_ids','relationship_span_ids'):
+            assert schema['$defs']['DeviceComponent']['properties'][name]['items']['enum']==[1,2,3]
+        class Response:
+            ok=True
+            def json(self):
+                return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps(_decision())}}]}
+        return Response()
+    with pymupdf.open() as doc:
+        page=doc.new_page(width=600,height=400)
+        result,_=request_qwen(context,page,api_key='test-key',request=fake_request)
+    assert result.model_raw=='iC65N-C10A/2P'
+
+
 def test_complete_enclosure_crop_excludes_neighbor_text():
     with pymupdf.open() as doc:
         page=doc.new_page(width=800,height=600)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 import pymupdf
+from .component_names import printed_device_caption
 from .notation import POWER_CURRENT_LABEL, extract_model_strings, local_tag, model_compatible, tagged_model_series
 from .cad_import import cad_stacked_model_owner
 
@@ -92,10 +93,6 @@ def _caption_owners(model, side, labelled):
     return tags  # Ambiguous edge captions remain unbound.
 
 
-_DEVICE_CAPTION = re.compile(
-    r"[\u4e00-\u9fffA-Za-z0-9]{0,18}(?:控制器|探测器|报警器|蜂鸣器|接触器|继电器|"
-    r"断路器|保护器|变送器|传感器|互感器|变频器|电源|电表|空调|灯|按钮盒|按钮|开关|插座|模块|轴卡)"
-)
 
 
 def device_captions(spans, anchors, bodies):
@@ -118,7 +115,7 @@ def device_captions(spans, anchors, bodies):
 
     owners = {}
     for span in spans:
-        if not (_DEVICE_CAPTION.fullmatch(span['text']) or re.fullmatch(r'(?:[A-Z]+\+)?RCBO', span['text'], re.I)):
+        if not (printed_device_caption(span['text']) or re.fullmatch(r'(?:[A-Z]+\+)?RCBO', span['text'], re.I)):
             continue
         x0,y0,x1,y1 = span['bbox']
         font = y1-y0
@@ -171,6 +168,11 @@ def stacked_device_annotations(spans, anchors):
             if re.fullmatch(r'/[1-9]\d*\.[0-9]', text):
                 bottom = y1
                 continue  # A cross-reference can be printed within the stack.
+            # A pin number beside the text stack is not the next device/line.
+            # Ignore it only when its box does not overlap the tag horizontally;
+            # numbers directly under the tag still terminate an ambiguous stack.
+            if text.isdigit() and (x0 >= ax1 or x1 <= ax0):
+                continue
             if not text or re.fullmatch(r'\d+|[A-Z]{1,3}\d?|[-+=][A-Z]+\d+[A-Z0-9]*', text, re.I):
                 break
             if any(other is not anchor and abs(other['bbox'][0] - x0) <= height

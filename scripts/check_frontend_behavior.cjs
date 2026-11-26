@@ -393,6 +393,7 @@ const response = data=>({ok:true,json:async()=>data});
   let savedPayload;
   request=async(_url,options)=>{savedPayload=JSON.parse(options.body); return response(fixture('new'));};
   app.startEdit(app.projectData.value.aggregated_bom[1]);
+  app.editForm.value.quantity='0';
   await app.saveEdit(app.drawerItem.value);
   assert.equal(savedPayload.quantity,0);
   assert.equal('seq_no' in savedPayload,false,'Do not fall back to a reused row number');
@@ -408,6 +409,7 @@ const response = data=>({ok:true,json:async()=>data});
   assert.equal('quantity' in savedPayload, false, 'Saving a note must not confirm a quantity');
 
   app.startEdit(app.projectData.value.aggregated_bom[2]);
+  app.editForm.value.remark='late save';
   let finishSave;
   request = () => new Promise(resolve => { finishSave = resolve; });
   const lateSave = app.saveEdit(app.drawerItem.value);

@@ -140,6 +140,7 @@ function saveWorkspacePreferences(value) {
 createApp({
   setup() {
     const projects = ref([]);
+    const currentRole = ref('engineer');
     const currentProjectId = ref("");
     const projectData = ref(null);
     const pageReferenceIndex = ref({project_id:'',links:[]});
@@ -437,7 +438,7 @@ createApp({
     }
 
     async function clearAllProjects() {
-      if (!confirm("这会删除所有项目的图纸和已保存审核结果，确定清空？")) return;
+      if (!confirm("将所有项目移入回收站？之后可以在项目管理中恢复。")) return;
       const res = await fetch("/api/projects/clear", { method: "POST" });
       if (res.ok) {
         projects.value = [];
@@ -446,7 +447,7 @@ createApp({
         activeBox.value = null;
         selectedItemId.value = "";
         selectedEvidences.value = [];
-        showToast("🗑️ 已清空所有历史项目与缓存记录！");
+        showToast("项目已移入回收站，可在项目管理中恢复");
       }
     }
 
@@ -1343,6 +1344,14 @@ createApp({
     }
     const tableScopeItems = computed(() => pageOrderActive.value ? Array.from(pagePositions.value.values(),entry=>entry.item) : baseBomList.value);
 
+    const tableCountLabel = computed(() => {
+      const total = baseBomList.value.length, scope = tableScopeItems.value.length, count = currentTableItems.value.length;
+      if (pageOrderActive.value) return filtersActive.value
+        ? `本页匹配 ${count} / ${scope} 项 · 全项目 ${total} 项`
+        : `本页 ${scope} 项 · 全项目 ${total} 项`;
+      return filtersActive.value ? `全项目匹配 ${count} / ${total} 项` : `全项目 ${total} 项`;
+    });
+
     const isAuxItem = (it) => {
       return (
         it.category === "auxiliary" ||
@@ -1354,19 +1363,51 @@ createApp({
     const auxCatCount = computed(() => tableScopeItems.value.filter((it) => isAuxItem(it)).length);
 
     function needsModel(item) {
-      return !item.model || /^(未提取|图纸未注|待定)/.test(item.model) || item.source_type === 'UNRESOLVED';
+      return !item.model || /^(未提取|图纸未注|待定)/.test(item.model);
+    }
+    function modelPendingLabel(item) {
+      const state = item.readiness?.model_state;
+      if (state && state.code !== 'KNOWN') return state.label;
+      return (item.evidences || []).some(e => ['model_text','model_candidate'].includes(e.role)) && needsModel(item)
+        ? '型号关联待核' : '待选型';
+    }
+    function hasPendingComponents(item) {
+      return (item.component_parts || []).some(p => p.kind !== 'main' && !p.materialized_item_id &&
+        (p.status !== 'CONFIRMED' || p.relationship !== 'integral'));
+    }
+    function componentLabel(kind) {
+      return {main:'本体',socket:'底座',contact_block:'触点模块',lamp_module:'灯模块',accessory:'附件',unknown:'部件待核'}[kind] || '部件';
+    }
+    async function materializeComponent(item, part) {
+      if (!displayedProjectIsCurrent() || editDirty.value || savingEdit.value) return;
+      savingEdit.value = true;
+      try {
+        const response = await fetch(`/api/projects/${currentProjectId.value}/bom/items/${encodeURIComponent(item.id)}/components/${encodeURIComponent(part.id)}/materialize`, {method:'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '部件未补入');
+        if (!applyProjectResponse(data)) return;
+        savingEdit.value = false;
+        refreshPanelAfterAction();
+        showToast('已补入独立采购部件，数量留空待核定。');
+      } catch (error) { showToast(error.message || '部件未补入，请重试'); }
+      finally { savingEdit.value = false; }
+    }
+    function componentEvidence(item, evidence) {
+      return locateItemEvidence(item, {...evidence, bbox:evidence.bbox || []});
     }
     function matchesIssue(item, issue) {
-      if (issue === 'MODEL') return needsModel(item) || (item.readiness?.issues || []).includes('待选型');
+      if (issue === 'MODEL') return needsModel(item) && modelPendingLabel(item) === '待选型';
+      if (issue === 'ASSOCIATION') return needsModel(item) && modelPendingLabel(item) === '型号关联待核';
+      if (issue === 'COMPONENTS') return hasPendingComponents(item);
       if (issue === 'QUANTITY') return item.quantity == null || ['unknown','needs_confirmation'].includes(item.quantity_status);
       if (issue === 'SCOPE') return !item.procurement_scope || item.procurement_scope === 'unknown';
       if (issue === 'REVIEW') return item.needs_review || item.readiness?.status === 'NEEDS_REVIEW';
       return true;
     }
-    const issueLabels = {ALL:'全部物料', MODEL:'待选型', QUANTITY:'数量待核', SCOPE:'范围待核', REVIEW:'待审核'};
+    const issueLabels = {ALL:'全部物料', MODEL:'待选型', ASSOCIATION:'型号关联待核', COMPONENTS:'本体/附件待核', QUANTITY:'数量待核', SCOPE:'范围待核', REVIEW:'待审核'};
     const issueCounts = computed(() => {
       const rows = primaryBomList.value;
-      return {ALL:rows.length, ...Object.fromEntries(['MODEL','QUANTITY','SCOPE','REVIEW'].map(key => [key, rows.filter(item => matchesIssue(item,key)).length]))};
+      return {ALL:rows.length, ...Object.fromEntries(['MODEL','ASSOCIATION','COMPONENTS','QUANTITY','SCOPE','REVIEW'].map(key => [key, rows.filter(item => matchesIssue(item,key)).length]))};
     });
     function setWorkspaceMode(mode) {
       workspaceMode.value = mode;
@@ -1389,6 +1430,8 @@ createApp({
     function itemIssues(item) {
       const issues = [];
       if (matchesIssue(item,'MODEL')) issues.push('待选型');
+      if (matchesIssue(item,'ASSOCIATION')) issues.push('型号关联待核');
+      if (hasPendingComponents(item)) issues.push('本体/附件待核');
       if (matchesIssue(item,'QUANTITY')) issues.push('数量待核');
       if (matchesIssue(item,'SCOPE')) issues.push('范围待核');
       if (item.parent_tag || ['assembly','contact'].includes(item.entity_role)) issues.push('组件待核');
@@ -1598,14 +1641,16 @@ createApp({
       finally {fieldClassificationBusy.value=false;}
     }
     async function acceptFieldClassification() {
+      if (editDirty.value || savingEdit.value) return;
       const result=fieldClassification.value;
       if (!result?.review_id || result.historical || result.review_status!=='PENDING' ||
-          !(result.analysis?.can_propose_update || result.analysis?.can_propose_brand) || !displayedProjectIsCurrent()) return;
+          !(result.analysis?.can_propose_update || result.analysis?.can_propose_brand || result.analysis?.can_propose_components) || !displayedProjectIsCurrent()) return;
       const response=await fetch(`/api/projects/${currentProjectId.value}/reviews/${result.review_id}/action`,{
         method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'ACCEPT'})});
       const data=await response.json();
       if (!response.ok) {fieldClassificationError.value=data.detail || '采纳失败，请重新核对';return;}
       if (!applyProjectResponse(data)) return;
+      refreshPanelAfterAction();
       fieldClassification.value={...result,review_status:'ACCEPTED'};
       fieldHistory.value={...fieldHistory.value,records:(fieldHistory.value.records || []).map(record =>
         record.review_id===result.review_id ? {...record,review_status:'ACCEPTED'} : record)};
@@ -1618,18 +1663,22 @@ createApp({
       if (!document.activeElement?.closest('.item-panel')) panelReturnFocus = document.activeElement;
       nextTick(() => document.querySelector('.item-panel input, .item-panel [data-panel-heading]')?.focus());
     }
-    function openItemDetails(item) {
-      if (editingId.value) return;
-      detailItemId.value = item.id;
-      selectBomRow(item);
-      focusItemPanel();
-      loadFieldHistory(item);
+    function openItemDetails(item) { startEdit(item); }
+    function openItemIssue(item, issue) {
+      const fields = {'待选型':'model', '型号关联待核':'model', '本体/附件待核':'components', '数量待核':'quantity', '范围待核':'procurement_scope', '组件待核':'parent_tag'};
+      if (startEdit(item)) nextTick(() => document.getElementById('bom-editor-' + (fields[issue] || 'name'))?.focus());
+    }
+    function refreshPanelAfterAction() {
+      const id = editingId.value;
+      const item = [...(projectData.value?.itemized_bom || []), ...(projectData.value?.aggregated_bom || [])].find(row => row.id === id);
+      if (item && !editDirty.value) startEdit(item);
     }
     function closeItemPanel() {
-      if (savingEdit.value) return;
-      if (editDirty.value && !confirm('还有未保存的修改，确定放弃？')) return;
+      if (savingEdit.value) return false;
+      if (editDirty.value && !confirm('还有未保存的修改，确定放弃？')) return false;
       editingId.value = ''; detailItemId.value = ''; editForm.value = {}; editItemSnapshot.value = null;
       nextTick(() => { if (panelReturnFocus?.isConnected) panelReturnFocus.focus(); });
+      return true;
     }
     async function locateItem(item) {
       if (workspaceMode.value === 'bom') { setWorkspaceMode('compare'); await nextTick(); }
@@ -1637,11 +1686,12 @@ createApp({
     }
     async function locateItemEvidence(item, evidence) {
       const tag = item.tag;
-      closeItemPanel();
+      if (!closeItemPanel()) return;
       if (workspaceMode.value === 'bom') { setWorkspaceMode('compare'); await nextTick(); }
       jumpToBomEvidence(item, evidence, tag);
     }
     async function deletePanelItem(item) {
+      if (editDirty.value || savingEdit.value) return;
       if (await deleteBomRow(item)) closeItemPanel();
     }
     function closeToolsMenu(event) { event.currentTarget.closest('details')?.removeAttribute('open'); }
@@ -1868,10 +1918,16 @@ createApp({
     }
 
     function startEdit(item) {
-      if (item.is_quantity_adjustment) {
-        showToast("数量调整记录用于追溯，请在采购汇总中修改总数量。");
-        return;
+      if (savingEdit.value) return false;
+      if (editDirty.value && !confirm('还有未保存的修改，确定放弃？')) return false;
+      if (item.is_quantity_adjustment || activeTab.value === 'filtered') {
+        editingId.value = ''; editForm.value = {}; editItemSnapshot.value = null;
+        detailItemId.value = item.id;
+        focusItemPanel(); loadFieldHistory(item);
+        if (item.is_quantity_adjustment) showToast('数量调整记录用于追溯，请在采购汇总中修改总数量。');
+        return false;
       }
+      selectedItemId.value = item.id;
       editingId.value = item.id;
       editItemSnapshot.value = JSON.parse(JSON.stringify(item));
       detailItemId.value = '';
@@ -1894,16 +1950,11 @@ createApp({
       };
       editInitialValues.value = JSON.stringify(editForm.value);
       focusItemPanel();
+      loadFieldHistory(item);
+      return true;
     }
 
-    function cancelEdit() {
-      if (savingEdit.value) return;
-      editingId.value = "";
-      detailItemId.value = '';
-      editForm.value = {};
-      editItemSnapshot.value = null;
-      nextTick(() => { if (panelReturnFocus?.isConnected) panelReturnFocus.focus(); });
-    }
+    function cancelEdit() { closeItemPanel(); }
 
     function displayedProjectIsCurrent() {
       return Boolean(currentProjectId.value && projectData.value?.project_id === currentProjectId.value);
@@ -1916,20 +1967,20 @@ createApp({
     }
 
     async function applySelection(item, suggestion, action) {
-      if (!displayedProjectIsCurrent()) return;
+      if (!displayedProjectIsCurrent() || editDirty.value || savingEdit.value) return;
       const id = item.member_ids?.length === 1 ? item.member_ids[0] : item.id;
       const response = await fetch(`/api/projects/${currentProjectId.value}/bom/item/${id}/selection`, {
         method: "POST", headers: {"Content-Type":"application/json"},
         body: JSON.stringify({model:suggestion.model, action}),
       });
       const data = await response.json();
-      if (response.ok) { if (!applyProjectResponse(data)) return; showToast(action === "ACCEPT" ? "已记录人工选型，原图型号和证据已保留。" : "已忽略该选型建议。"); }
+      if (response.ok) { if (!applyProjectResponse(data)) return; refreshPanelAfterAction(); showToast(action === "ACCEPT" ? "已记录人工选型，原图型号和证据已保留。" : "已忽略该选型建议。"); }
       else { showToast(data.detail || "选型处理失败"); }
     }
 
     async function saveEdit(item) {
       if (!displayedProjectIsCurrent()) return;
-      if (!item || savingEdit.value) return;
+      if (!item || savingEdit.value || !editDirty.value) return;
       if (editTargetChanged.value) { showToast('后台结果已更新，修改尚未保存。请关闭侧栏后重新选择物料。'); return; }
       const viewMode =
         activeTab.value === "secondary"
@@ -2266,6 +2317,7 @@ createApp({
     }
 
     onMounted(() => {
+      fetch('/api/auth/me').then(r=>r.json()).then(u=>{currentRole.value=u.role||'engineer'}).catch(()=>{});
       fetchProjects();
 
       const handleGlobalEsc = (e) => {
@@ -2324,6 +2376,7 @@ createApp({
       clearActiveBox,
       handleCanvasClick,
       projects,
+      currentRole,
       fetchProjects,
       currentProjectId,
       projectData,
@@ -2332,14 +2385,14 @@ createApp({
       showCadSheets, cadSelectedPages, createCadSelection,
       leftPaneWidth,
       workspaceMode, setWorkspaceMode, overviewExpanded, toggleOverview, issueFilter, issueLabels, issueCounts, focusIssue, resetFilters, filtersActive,
-      needsModel, itemIssues, scopeLabel, roleLabel, evidencePages, itemDrawingReference, matchesIssue, hasDistinctSpecification, drawingAnnotations, drawingAnnotationSummary,
+      needsModel, modelPendingLabel, hasPendingComponents, componentLabel, componentEvidence, materializeComponent, itemIssues, scopeLabel, roleLabel, evidencePages, itemDrawingReference, matchesIssue, hasDistinctSpecification, drawingAnnotations, drawingAnnotationSummary,
       reviewStatusFilter, visibleReviews, awaitingFirstBom, pagesToCheck, expandedReview, unboundLocations, detailItemId, drawerItem, savingEdit, editDirty, editTargetChanged,
       fieldClassification, fieldClassificationBusy, fieldClassificationError, fieldClassificationTarget, classifyDrawingText, acceptFieldClassification,
       fieldHistory, fieldHistoryBusy, fieldHistoryError, formatFieldRecordTime, showFieldRecord,
       fieldPreview, fieldPreviewBusy, previewDrawingText,
       qwenKeyValue, qwenHasKey, qwenKeySource, qwenKeySaving, qwenTestBusy, qwenTestResult,
       openQwenKeyEditor, saveQwenKey, testQwenConnection,
-      openItemDetails, closeItemPanel, locateItem, locateItemEvidence, deletePanelItem, closeToolsMenu,
+      openItemDetails, openItemIssue, tableCountLabel, closeItemPanel, locateItem, locateItemEvidence, deletePanelItem, closeToolsMenu,
       isResizingSplit,
       pdfViewportRef,
       pdfStageRef,

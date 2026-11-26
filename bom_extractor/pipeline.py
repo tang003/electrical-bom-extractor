@@ -232,6 +232,8 @@ def run_extraction_pipeline(
             declared_parts=declared_parts,
         )
 
+        from .material_scope import exclude_estimated_wires
+        exclude_estimated_wires(result)
         result.summary['procurement']=procurement_summary(result)
         attach_cad_evidence(result,cad)
         reconcile(result)

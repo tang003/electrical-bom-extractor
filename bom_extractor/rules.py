@@ -53,6 +53,8 @@ def build_aggregated_from_itemized(itemized_items: List[BOMItem]) -> List[BOMIte
                 if tg and tg not in agg.tags:
                     agg.tags.append(tg)
             agg.evidences.extend(it.evidences)
+            from .components import merge_parts
+            agg.component_parts = merge_parts(agg.component_parts, it.component_parts)
             if agg.model_origin!=it.model_origin:agg.model_origin='mixed'
             agg.parts_reference_id=','.join(dict.fromkeys(filter(None,[*agg.parts_reference_id.split(','),it.parts_reference_id])))
             if it.needs_review:

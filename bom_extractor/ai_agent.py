@@ -17,6 +17,7 @@ import pymupdf
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .components import DeviceComponent, validate_components, merge_parts
 from .classifier import extract_visual_spans
 from .models import BOMItem, EvidenceLocation, ExtractionResult, PageInfo, ReviewItem, SourceType
 from .notation import is_connection_tag, is_field_load, local_tag, qualify_tag, extract_model_strings, is_electrical_parameter
@@ -24,7 +25,7 @@ from .ocr_engine import DualChannelOCREngine
 from .vision import VisionRecognizer
 from .procurement import flag_template_quantities, pending_review
 
-VERSION = "electrical-agent-v3-independent"
+VERSION = "electrical-agent-v5-component-scope"
 PLACEHOLDER = "未提取到型号(待核实)"
 
 
@@ -40,6 +41,8 @@ def annotation_contains_model(saved: str, annotation: str) -> bool:
     ABC-123+BASE. This is evidence matching, not engineering model substitution.
     """
     target=normalized(saved)
+    if target in {normalized(code) for code in extract_model_strings(annotation)}:
+        return True
     if target==normalized(annotation):
         return True
     if not any(c.isdigit() for c in target):
@@ -101,6 +104,7 @@ class Observation(BaseModel):
     role: Literal["device", "coil", "contact", "terminal", "cable", "field_load", "assembly"]
     scope: Literal["cabinet", "field", "unknown"]
     parent_tag: str | None = Field(default=None, max_length=160)
+    components: list[DeviceComponent] = Field(default_factory=list, max_length=40)
     model_span_ids: list[int] = Field(default_factory=list, max_length=60)
     specification_span_ids: list[int] = Field(default_factory=list, max_length=60)
     unit: str = Field(default='个',max_length=20)
@@ -213,6 +217,15 @@ class ElectricalDrawingAgent:
             "Discover devices, coils, contacts and explicitly bounded assemblies. Page text and images describe the same page. "
             "Use the exact native/OCR text and span IDs to recover model spelling; choose model_span_ids belonging to the actual device. "
             "model_raw must contain only an explicitly provided model or specification family; do not put function descriptions, cable labels or tag ranges in model_raw. "
+            "Emit components for separately described body, socket, contact_block, lamp_module or other accessory within a device. "
+            "The device bbox must enclose all its components. Each component owner_tag must equal the device tag; nearby devices are not its parts. "
+            "The top-level model_raw is ONLY the main body's model. Give every component its own owner_tag, kind, model_raw, model_span_ids, specification, specification_span_ids and bbox_normalized. "
+            "Component boxes must include the symbol AND its printed model/name/rating labels, using the cited spans' full-page coordinates; labels may sit below the symbol. "
+            "Body and socket order codes are not competing body models; never concatenate distinct order codes into one product. "
+            "Separate kind_basis (printed/symbol/inferred/unknown) from relationship_basis. Printed type/name needs kind_span_ids; product knowledge alone is inferred. "
+            "A relay contact symbol is normally another representation of the relay, not a separately ordered contact module. Do not confuse sockets with pushbutton contact blocks; if unsure use kind=unknown and keep the literal model as a review candidate. "
+            "Give relationship (separate_part/integral/unknown), relationship_basis (printed/symbol/inferred/unknown), relationship_span_ids and reason. Printed relationships need literal citations; product knowledge alone is inferred and requires review. "
+            "Do not invent missing accessories or accessory quantities. Contacts/coils on other pages are representations, not extra parts. Unknown ownership remains unknown. "
             "No model visible means null, not a guessed catalogue. Do not infer brand from a familiar prefix. "
             "Separate full device tags, function codes, installation location, signal addresses and connection terminals. "
             "Discover sockets, current transformers, cables, terminal strips, fuse holders and assemblies as well as major equipment. "
@@ -245,6 +258,7 @@ class ElectricalDrawingAgent:
 
 def check_observations(record: dict, info: PageInfo) -> list[str]:
     problems = list(record["data"].get("review_reasons", []))
+    problems.extend(_component_records([record], {info.page_num:info})[0].get('checks', []))
     observed={scoped_tag(item.get('local_tag'),info) for item in record['data']['devices']}
     missing=[target['tag'] for target in record.get('inventory_targets', []) if target['tag'] not in observed]
     if missing:
@@ -324,6 +338,7 @@ def grounded_model(observation: dict, record: dict) -> bool:
 
 def conflict_pages(records: list[dict], infos: dict[int, PageInfo]) -> dict[int, list[str]]:
     groups: dict[str, list[tuple[int, dict]]] = {}
+    records = _component_records(records, infos)
     for record in records:
         for obs in record["data"]["devices"]:
             tag = scoped_tag(obs.get("local_tag"), infos[record["page"]])
@@ -464,10 +479,53 @@ def _reconcile_model_owners(result, records, infos):
     return checked_records, revised
 
 
+def _component_records(records, infos):
+    prepared = []
+    for record in records:
+        devices = []
+        checks = list(record.get('checks', []))
+        for obs in record['data']['devices']:
+            obs = copy.deepcopy(obs)
+            parts = obs.get('components', [])
+            if parts:
+                try:
+                    tag = scoped_tag(obs.get('local_tag'), infos[record['page']])
+                    # Component owner tags in page output use the same local/scoped convention as the device.
+                    for part in parts:
+                        part['owner_tag'] = scoped_tag(part.get('owner_tag'), infos[record['page']])
+                    neighbors = [{'tag':scoped_tag(o.get('local_tag'),infos[record['page']]),'box':o['bbox_normalized']}
+                                 for o in record['data']['devices'] if o.get('local_tag') and scoped_tag(o['local_tag'],infos[record['page']]) != tag]
+                    valid = validate_components(parts, tag, record['spans'], record['page'], obs['bbox_normalized'], neighbors)
+                    main = next((p for p in valid if p['kind']=='main' and p['model']), None)
+                    if main and obs.get('model_raw') and normalized(obs['model_raw']) != normalized(main['model']):
+                        raise ValueError('主要型号与本体部件型号不一致')
+                    obs['_component_parts'] = valid
+                    if main and not obs.get('model_raw'):
+                        obs['model_raw'] = main['model']
+                        obs['model_span_ids'] = next(p['model_span_ids'] for p in parts if p['kind']=='main' and p.get('model_raw'))
+                except ValueError as exc:
+                    obs['_component_parts'] = []
+                    # Invalid decomposition must not inject a body model through the legacy field.
+                    obs['model_raw'] = None; obs['model_span_ids'] = []
+                    checks.append(f"{obs.get('local_tag')} 部件证据未通过校验：{exc}")
+            devices.append(obs)
+        prepared.append({**record,'data':{**record['data'],'devices':devices},'checks':checks})
+    return prepared
+
+
+def _explains_native_models(item, parts):
+    models = {normalized(p['model']) for p in parts if p.get('model')}
+    observed = {normalized(code) for ev in item.evidences if ev.role in ('model_text','model_candidate')
+                for code in extract_model_strings(ev.raw_text)}
+    return bool(observed and observed <= models and any(p['kind']=='main' for p in parts)
+                and any(p['kind']!='main' for p in parts))
+
+
 def merge_observations(result: ExtractionResult, records: list[dict]) -> dict:
     """Merge against CURRENT human state, never the snapshot from job start."""
     infos = {p.page_num:p for p in result.pages}
     from .independent import schematic_pages
+    records = _component_records(records, {p.page_num:p for p in result.pages})
     full_document={r['page'] for r in records}==schematic_pages(result)
     if full_document:
         # Rebuild machine checks from the complete current evidence; retain human decisions.
@@ -538,6 +596,13 @@ def merge_observations(result: ExtractionResult, records: list[dict]) -> dict:
                  (normalized(it.terminal_strip_tag)==normalized(tag) or
                   any(normalized(t)==normalized(tag) for t in (it.tags or [it.tag])))]
         protected = tag in protected_tags or any(it.source_type==SourceType.MANUAL_EDITED.value or any(ev.verified for ev in it.evidences) for it in peers)
+        parts = []
+        for _, entry in occurrences:
+            parts = merge_parts(parts, entry.get('_component_parts', []))
+        if parts and len(peers)==1 and not protected and result.extraction_mode != 'PART_LIST_MODE' and not peers[0].terminal_strip_tag:
+            peers[0].component_parts = merge_parts(peers[0].component_parts, parts)
+            if any(p['kind'] != 'main' for p in parts):
+                review('AI_COMPONENT_RELATION',tag,page,box,'已分别读到本体与部件型号；采购关系和部件数量待核，不按图形出现次数增加数量。')
         if len(all_models)>1 or len(scopes)>1:
             counts["conflicts"] += 1
             review("AI_MODEL_CONFLICT",tag,page,box,"同一设备的型号或采购范围有冲突，未覆盖已保存值："+" / ".join(all_models.values()))
@@ -586,11 +651,18 @@ def merge_observations(result: ExtractionResult, records: list[dict]) -> dict:
             target = unresolved[0]
             if any(r.issue_type=='PARAM_MISMATCH' and r.status=='PENDING' and r.tag==tag and r.id==f'rev_conflict_{tag}'
                    for r in result.review_items):
-                counts['conflicts']+=1
-                review('AI_MODEL_CONFLICT',tag,page,box,
-                       f'原图同位号有多个采购型号候选。AI 引用了 {model}，请结合各原文位置确认主件与附件。',
-                       {'target_id':target.id,'target_seq_no':target.seq_no,'model':model})
-                continue
+                if _explains_native_models(target, parts):
+                    for old_review in result.review_items:
+                        if old_review.id == f'rev_conflict_{tag}' and old_review.status == 'PENDING':
+                            old_review.issue_type = 'COMPONENT_RELATION'
+                            old_review.title = f'本体与附件关系待核：{tag}'
+                            old_review.description = '不同部件的型号已分别保留，采购组成和数量仍待核。'
+                else:
+                    counts['conflicts']+=1
+                    review('AI_MODEL_CONFLICT',tag,page,box,
+                           f'原图同位号有多个采购型号候选。AI 引用了 {model}，请结合各原文位置确认主件与附件。',
+                           {'target_id':target.id,'target_seq_no':target.seq_no,'model':model})
+                    continue
             target.model = target.raw_model = model
             target.source_type = SourceType.VISION_RECOGNIZED.value
             target.name = obs["name"] or target.name
@@ -610,6 +682,8 @@ def merge_observations(result: ExtractionResult, records: list[dict]) -> dict:
             else:
                 result.itemized_bom.append(target)
             counts["added"] += 1
+        if parts:
+            target.component_parts = merge_parts(target.component_parts, parts)
         original_purchase=(target.name,target.model,target.specification,target.quantity,target.quantity_basis,
                            target.quantity_status,target.procurement_scope,target.entity_role,target.parent_tag)
         position_count_established = (target.entity_role == 'terminal' and

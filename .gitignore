@@ -13,6 +13,7 @@ dataset/yolo_electrical/runs/
 
 .env
 .env.*
+.local/
 *.local.json
 
 tools/cad_converter/bin/

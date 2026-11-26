@@ -105,6 +105,7 @@ class BOMItem:
     model_origin: str = ""
     parts_reference_id: str = ""
     procurement_name: str = ""              # Device class before AI adds a drawing-specific functional description
+    component_parts: List[Dict[str, Any]] = field(default_factory=list)  # Evidence-backed body/socket/accessory candidates
     terminal_strip_tag: str = ""             # Parent strip identity when one strip has several terminal models
     terminal_numbers: List[int] = field(default_factory=list)  # Drawn numbers for this material row
 

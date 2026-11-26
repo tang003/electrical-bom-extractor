@@ -9,6 +9,7 @@ from pathlib import Path
 import threading
 import time
 import uuid
+from .auth import actor
 
 import pymupdf
 
@@ -37,16 +38,27 @@ class AIJobManager:
     def save(self, job):
         with self.guard:
             job["updated_at"] = time.time()
-            save_json(self.path(job["project_id"],job["id"]), job)
+            repo=self.get_store().repository
+            if repo:
+                with repo.connection(job.get('requested_by')) as conn:
+                    conn.execute("INSERT INTO ai_jobs(id,project_id,input_data_version,drawing_version,requested_by,status,progress,cancel_requested,heartbeat_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,now()) ON CONFLICT(id) DO UPDATE SET status=excluded.status,progress=excluded.progress,cancel_requested=excluded.cancel_requested,heartbeat_at=now(),updated_at=now(),input_data_version=excluded.input_data_version",(job['id'],job['project_id'],job.get('input_data_version',0),job.get('drawing_version',1),job.get('requested_by'),job['status'],json.dumps(job,ensure_ascii=False),job.get('cancel_requested',False)))
+            else:
+                save_json(self.path(job["project_id"],job["id"]), job)
 
     def get(self, project, job_id):
         with self.guard:
             job = self.jobs.get((project,job_id))
             if job is None:
-                path = self.path(project,job_id)
-                if not path.is_file():
-                    raise KeyError(job_id)
-                job = json.loads(path.read_text(encoding="utf-8"))
+                repo=self.get_store().repository
+                if repo:
+                    with repo.connection(actor.get()['id'] if actor.get() else None) as conn:
+                        row=conn.execute('SELECT progress FROM ai_jobs WHERE project_id=%s AND id=%s',(project,job_id)).fetchone()
+                    if not row: raise KeyError(job_id)
+                    job=row['progress']
+                else:
+                    path = self.path(project,job_id)
+                    if not path.is_file(): raise KeyError(job_id)
+                    job = json.loads(path.read_text(encoding="utf-8"))
                 if job["status"] in ACTIVE:
                     job["status"] = "interrupted"
                     job["message"] = "服务重启中断了任务；可重新运行，已完成页面会使用缓存。"
@@ -75,6 +87,8 @@ class AIJobManager:
                         raise ValueError("已有任务正在处理其他页码，请在该任务结束后启动")
                     return copy.deepcopy(job)
             job = {"id":uuid.uuid4().hex,"project_id":project,"status":"queued","message":"等待后台识别",
+                   "requested_by":str(actor.get()['id']) if actor.get() else None,
+                   "input_data_version":store.data_versions.get(project,0),"drawing_version":1,
                    "pages":selected,"total_pages":len(selected),"completed_pages":0,"reviewed_pages":0,
                    "current_page":None,"api_calls":0,"cache_hits":0,"input_tokens":0,"output_tokens":0,
                    "errors":[],"cancel_requested":False,"model":vision.model,
@@ -87,6 +101,8 @@ class AIJobManager:
             result.summary["ai_job_id"] = job["id"]
             try:
                 store.sync_and_persist(project)
+                job['input_data_version']=store.data_versions.get(project,0)
+                self.save(job)
                 self.executor.submit(self.run,job,vision)
             except Exception:
                 job.update(status="failed", message="后台任务未能启动，请检查项目保存状态后重试")
@@ -106,6 +122,7 @@ class AIJobManager:
 
     def run(self, job, vision):
         store=self.get_store()
+        context_token=actor.set({'id':job['requested_by']}) if job.get('requested_by') else None
         folder=Path(self.get_output())/job["project_id"]
         try:
             with store.lock:
@@ -232,6 +249,8 @@ class AIJobManager:
             with store.lock:
                 if job["project_id"] not in store.results:
                     raise StopJob("项目已删除，任务结果未写入")
+                if store.repository and store.data_versions.get(job['project_id']) != job['input_data_version']:
+                    raise StopJob('项目已由工程师更新；旧 AI 结果没有覆盖新版本，请重新运行')
                 result=store.results[job["project_id"]]
                 save_json(folder/"history"/f"before_ai_merge_{job['id']}.json",result.to_dict())
                 draft=copy.deepcopy(result)
@@ -250,7 +269,8 @@ class AIJobManager:
                 try:
                     store.sync_and_persist(job["project_id"])
                 except Exception:
-                    store.results[job["project_id"]]=result
+                    if not store.repository or store.data_versions.get(job['project_id']) == job['input_data_version']:
+                        store.results[job["project_id"]]=result
                     raise
             job.update(status="partial" if job["errors"] else "completed",current_page=None,
                        message="AI 识别结果已合并；型号、采购范围和数量请在审核清单确认")
@@ -260,3 +280,7 @@ class AIJobManager:
             job.update(status="failed",message=str(exc)[:300])
         finally:
             self.save(job)
+            if store.repository:
+                with store.repository.connection(job.get('requested_by')) as conn:
+                    conn.execute("INSERT INTO ai_runs(id,job_id,project_id,input_data_version,drawing_version,model,model_config,prompt_version,rules_version,memory_versions,result_validation,usage,error) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(uuid.uuid4(),job['id'],job['project_id'],job.get('input_data_version'),job.get('drawing_version'),job.get('model'),json.dumps({'reasoning_effort':job.get('reasoning_effort'),'review_reasoning_effort':job.get('review_reasoning_effort')}),VERSION,'current','[]',json.dumps({'status':job['status'],'merge':job.get('merge')},ensure_ascii=False),json.dumps({'api_calls':job.get('api_calls'),'input_tokens':job.get('input_tokens'),'output_tokens':job.get('output_tokens')}),job.get('message') if job['status'] in ('failed','interrupted') else None))
+            if context_token is not None: actor.reset(context_token)

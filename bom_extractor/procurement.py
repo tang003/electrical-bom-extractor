@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from .models import ReviewItem, SourceType
+from .components import model_state, components_pending
 
 UNKNOWN_MODEL = ("未提取", "图纸未注", "待定")
 RANGE = re.compile(r"([A-Z]{1,8})(\d+)\s*([-–~～至到])\s*([A-Z]{1,8})?(\d+)", re.I)
@@ -74,14 +75,16 @@ def flag_template_quantities(items, reviews, pages):
 
 def item_readiness(item):
     issues=[]
-    if not item.model or item.model.startswith(UNKNOWN_MODEL):issues.append('待选型')
+    state=model_state(item)
+    if state['code'] != 'KNOWN':issues.append(state['label'])
+    if components_pending(item):issues.append('本体/附件待核')
     if item.quantity is None or item.quantity_status in ('unknown','needs_confirmation'):issues.append('待核数量/长度')
     if item.procurement_scope=='unknown':issues.append('待核采购范围')
     if item.procurement_scope=='excluded':issues.append('不在采购范围')
     if item.parent_tag or item.entity_role in ('assembly','contact'):issues.append('待核组件关系')
     if item.needs_review:issues.append('待审核证据')
     if any(s.get('status')=='PENDING' for s in item.selection_suggestions):issues.append('有选型建议未采纳')
-    return {'status':'NEEDS_REVIEW' if issues else 'REVIEWED', 'issues':issues}
+    return {'status':'NEEDS_REVIEW' if issues else 'REVIEWED', 'issues':issues, 'model_state':state}
 
 
 def procurement_summary(result):
@@ -91,6 +94,8 @@ def procurement_summary(result):
         'quantity_pending':sum('待核数量/长度' in x['issues'] for x in decisions),
         'scope_pending':sum('待核采购范围' in x['issues'] for x in decisions),
         'selection_pending':sum('待选型' in x['issues'] for x in decisions),
+        'model_association_pending':sum('型号关联待核' in x['issues'] for x in decisions),
+        'components_pending':sum('本体/附件待核' in x['issues'] for x in decisions),
         'definition':'按位号明细统计采购审核状态，不是识别准确率。'}
 
 

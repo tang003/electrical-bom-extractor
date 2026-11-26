@@ -22,12 +22,15 @@ import numpy as np
 import pymupdf
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ConfigDict, StrictInt
 
+from bom_extractor.component_names import FALLBACK_NAMES, repair_saved_component_names
+from bom_extractor.material_scope import exclude_estimated_wires
+from bom_extractor.components import merge_parts
 from bom_extractor.models import ExtractionResult, BOMItem, EvidenceLocation, SourceType, ReviewItem
 from bom_extractor.pipeline import run_extraction_pipeline
 from bom_extractor.rules import build_aggregated_from_itemized, load_rules_config
@@ -58,6 +61,8 @@ from bom_extractor.independent import analysis_source, independent_policy, legac
 from bom_extractor.reconciliation import norm, reconcile, tag_key
 from bom_extractor.table_workflow import table_policy,TABLE_MODE,CHECK_MODE
 from .ai_jobs import AIJobManager
+from .pg_store import PgRepository, Conflict
+from .auth import actor, request_id, create_auth_router
 from .page_images import page_image
 from bom_extractor.cad_import import CadImportError, drawing_capabilities, prepare_cad, native_document, attach_cad_evidence, select_cad_sheets
 
@@ -69,6 +74,7 @@ FRONTEND_DIR = ROOT_DIR / "frontend"
 RULES_PATH = ROOT_DIR / "bom_extractor" / "rules_config.json"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+repository = PgRepository(os.environ['BOM_DATABASE_URL']) if os.environ.get('BOM_DATABASE_URL') else None
 
 app = FastAPI(
     title="工业电气原理图 BOM 自动提取与图文审核系统",
@@ -82,12 +88,47 @@ async def add_no_cache_header(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and origin != str(request.base_url).rstrip("/"):
         return JSONResponse({"detail": "只允许工作台同源访问"}, status_code=403)
-    response = await call_next(request)
-    if request.url.path.startswith("/assets/") or request.url.path == "/":
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-    return response
+    token = None
+    if repository and request.url.path.startswith('/api/') and not request.url.path.startswith('/api/auth/'):
+        try:
+            user = auth_service.require(request)
+            if request.method not in ('GET','HEAD','OPTIONS'):
+                auth_service.csrf(request,user)
+            match = re.match(r'^/api/projects/([^/]+)',request.url.path)
+            if match and match.group(1) not in ('upload','clear','trash','ownership'):
+                include_trash=request.url.path.endswith('/restore') or '/revisions/' in request.url.path
+                if match.group(1) not in repository.visible_ids(user['id'],include_trash):
+                    raise HTTPException(404,'项目不存在')
+                exempt=request.url.path==f'/api/projects/{match.group(1)}/restore' or '/revisions/' in request.url.path or any(piece in request.url.path for piece in ('/ai-extract','/ai-jobs/','/transfer','/trash'))
+                if request.method not in ('GET','HEAD','OPTIONS') and not exempt:
+                    supplied=request.headers.get('if-match')
+                    if supplied is None: raise HTTPException(428,'请刷新项目后再修改')
+                    try: expected=int(supplied.strip('"'))
+                    except ValueError: raise HTTPException(400,'项目版本格式无效')
+                    if expected!=repository.version(match.group(1),user['id']):
+                        raise HTTPException(409,'项目已被其他操作更新，请刷新后重试')
+            if request.url.path in ('/api/rules','/api/vlm-config','/api/qwen-config','/api/qwen-config/test','/api/yolo-dataset') and request.method not in ('GET','HEAD') and user['role']!='admin':
+                raise HTTPException(403,'需要管理员权限')
+            token = actor.set(user)
+        except HTTPException as exc:
+            return JSONResponse({'detail':exc.detail},status_code=exc.status_code)
+    supplied_request_id=request.headers.get('x-request-id','')
+    request_token=request_id.set(supplied_request_id if re.fullmatch(r'[A-Za-z0-9._-]{1,64}',supplied_request_id) else uuid.uuid4().hex)
+    try:
+        response = await call_next(request)
+        response.headers['X-Request-ID']=request_id.get()
+        if repository and token is not None:
+            match=re.match(r'^/api/projects/([^/]+)',request.url.path)
+            if match and match.group(1) in store.data_versions:
+                response.headers['X-BOM-Version']=str(store.data_versions[match.group(1)])
+        if request.url.path.startswith("/assets/") or request.url.path == "/":
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+    finally:
+        if token is not None: actor.reset(token)
+        request_id.reset(request_token)
 
 if (FRONTEND_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
@@ -100,10 +141,30 @@ class ProjectStore:
         self.pdf_paths: Dict[str, Path] = {}
         self.gt_paths: Dict[str, Path] = {}
         self.load_errors: Dict[str, str] = {}
+        self.repository = repository
+        self.data_versions: Dict[str,int] = {}
 
     def initialize_defaults(self) -> None:
         """Load saved state first. A broken snapshot must never trigger an overwrite."""
         self.load_errors: Dict[str, str] = {}
+        if self.repository:
+            with self.repository.connection() as conn:
+                admin=conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+            if not admin: raise RuntimeError('缺少初始管理员账号')
+            for row in self.repository.list_project_snapshots(admin['id']):
+                result=ExtractionResult.from_dict(row['snapshot'])
+                exclude_estimated_wires(result)
+                repair_saved_component_names(result)
+                self.results[row['id']]=result
+                self.data_versions[row['id']]=row['data_version']
+                source=Path(row['source_path']) if row['source_path'] else None
+                if source and source.is_file(): self.pdf_paths[row['id']]=source
+                else:
+                    fallback=REF_DIR/Path(result.pdf_filename).name
+                    if fallback.is_file(): self.pdf_paths[row['id']]=fallback
+            for project_id in self.pdf_paths:
+                self.refresh_drawing_label_rules(project_id)
+            return
         if not OUTPUT_DIR.exists():
             return
         for proj_dir in sorted(OUTPUT_DIR.iterdir()):
@@ -149,6 +210,8 @@ class ProjectStore:
                                 saved.itemized_bom.append(correction)
                         saved.aggregated_bom = build_aggregated_from_itemized(saved.itemized_bom)
                         saved.summary["state_schema_version"] = 2
+                    exclude_estimated_wires(saved)
+                    repair_saved_component_names(saved)
                     self.results[saved.project_id] = saved
                     pdf_file = pdfs[0] if pdfs else REF_DIR / Path(saved.pdf_filename).name
                     if pdf_file.exists():
@@ -161,6 +224,22 @@ class ProjectStore:
             except Exception as exc:
                 self.load_errors[proj_dir.name] = str(exc)
                 logging.getLogger(__name__).error("无法恢复项目 %s；已保留原文件: %s", proj_dir.name, exc)
+        for project_id in self.pdf_paths:
+            self.refresh_drawing_label_rules(project_id)
+
+    def refresh_drawing_label_rules(self, proj_id: str) -> None:
+        result = self.results[proj_id]
+        if (table_policy(result) or legacy_table_project(result) or proj_id not in self.pdf_paths
+                or not any(item.name in FALLBACK_NAMES for item in result.itemized_bom)):
+            return
+        try:
+            # Independent workflows must keep their table-isolated evidence boundary.
+            source = analysis_source(result, self.pdf_paths[proj_id], OUTPUT_DIR / proj_id)
+            with pymupdf.open(source) as doc:
+                repair_saved_component_names(result, doc)
+        except (ValueError, OSError, RuntimeError) as exc:
+            # A missing or incompatible source must not stop recovery of saved edits.
+            logging.getLogger(__name__).warning("项目 %s 名称规则未重新应用，保留已保存结果: %s", proj_id, exc)
 
     def clear_all(self) -> None:
         self.results.clear()
@@ -175,6 +254,9 @@ class ProjectStore:
 
     def sync_and_persist(self, proj_id: str, rebuild_aggregated: bool = True) -> ExtractionResult:
         res = self.results[proj_id]
+        self.refresh_drawing_label_rules(proj_id)
+        repair_saved_component_names(res)
+        exclude_estimated_wires(res)
         if res.source_format in {"dwg", "dxf"} and proj_id in self.pdf_paths:
             with pymupdf.open(self.pdf_paths[proj_id]) as cad_view:
                 attach_cad_evidence(res, native_document(cad_view))
@@ -231,11 +313,26 @@ class ProjectStore:
                 res.summary["yolo_dataset_status"] = {"status": "archive_failed", "message": "BOM 已保存，训练样本归档失败，请稍后重试"}
         export_to_json(res, proj_out / "project_state.json")
         export_to_json(res, res.summary["json_path"])
+        if self.repository:
+            user=actor.get()
+            if not user: raise RuntimeError('缺少项目操作身份')
+            try:
+                self.data_versions[proj_id]=self.repository.save_result(res,user['id'],expected_version=self.data_versions.get(proj_id),source='project_update',summary='更新项目',source_path=str(self.pdf_paths[proj_id]) if proj_id in self.pdf_paths else None)
+            except Conflict as exc:
+                with self.repository.connection(user['id']) as conn:
+                    row=conn.execute('SELECT snapshot,data_version FROM projects WHERE id=%s',(proj_id,)).fetchone()
+                if row:
+                    self.results[proj_id]=ExtractionResult.from_dict(row['snapshot'])
+                    self.data_versions[proj_id]=row['data_version']
+                raise HTTPException(409,str(exc)) from exc
         return res
 
 
 store = ProjectStore()
 ai_jobs = AIJobManager(lambda: store, lambda: OUTPUT_DIR)
+if repository:
+    auth_router,auth_service=create_auth_router(repository,secure_cookies=os.environ.get('BOM_COOKIE_SECURE')=='1')
+    app.include_router(auth_router)
 
 
 def serialized_mutation(function):
@@ -263,6 +360,8 @@ def _auto_start_ai(project_id):
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if repository is None and os.environ.get('BOM_LEGACY_TEST_MODE')!='1':
+        raise RuntimeError('请设置 BOM_DATABASE_URL；生产工作台必须使用 PostgreSQL 与账号验证')
     VisionRecognizer.load_saved_config()  # migrate any legacy credential before serving requests
     store.initialize_defaults()
 
@@ -273,6 +372,7 @@ def _serialize_project_response(proj_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Project {proj_id} not found")
     res = store.results[proj_id]
     data = res.to_dict()
+    if store.repository: data['data_version']=store.data_versions.get(proj_id)
     from bom_extractor.procurement import item_readiness, procurement_summary
     for key in ('itemized_bom','aggregated_bom','filtered_items'):
         for raw,item in zip(data[key],getattr(res,key)):
@@ -286,7 +386,14 @@ def _serialize_project_response(proj_id: str) -> Dict[str, Any]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index_page() -> HTMLResponse:
+def index_page(request: Request) -> HTMLResponse:
+    if repository:
+        try:
+            user=auth_service.current(request)
+        except HTTPException:
+            return RedirectResponse('/login',status_code=303)
+        if user['must_change_password']:
+            return RedirectResponse('/login?change=1',status_code=303)
     index_file = FRONTEND_DIR / "index.html"
     if not index_file.exists():
         return HTMLResponse("<h1>Frontend index.html not found</h1>", status_code=404)
@@ -301,11 +408,30 @@ def index_page() -> HTMLResponse:
     return resp
 
 
+@app.get('/login',response_class=HTMLResponse)
+def login_page():
+    return HTMLResponse((FRONTEND_DIR/'login.html').read_text(encoding='utf-8'))
+
+
+@app.get('/admin',response_class=HTMLResponse)
+def admin_page(request: Request):
+    if repository: auth_service.admin(request)
+    return HTMLResponse((FRONTEND_DIR/'admin.html').read_text(encoding='utf-8'))
+
+
+@app.get('/projects',response_class=HTMLResponse)
+def projects_page(request: Request):
+    if repository: auth_service.require(request)
+    return HTMLResponse((FRONTEND_DIR/'projects.html').read_text(encoding='utf-8'))
+
+
 @app.get("/api/projects")
 @serialized_mutation
 def list_projects() -> List[Dict[str, Any]]:
     items = []
+    visible=store.repository.visible_ids(actor.get()['id']) if store.repository else set(store.results)
     for pid, res in store.results.items():
+        if pid not in visible: continue
         items.append({
             "project_id": pid,
             "pdf_filename": res.pdf_filename,
@@ -326,6 +452,84 @@ def list_projects() -> List[Dict[str, Any]]:
     return items
 
 
+@app.get('/api/projects/trash')
+def trash_projects():
+    user=actor.get()
+    if not repository: return []
+    with repository.connection(user['id']) as conn:
+        return conn.execute("SELECT id,name,owner_id,data_version FROM projects WHERE state='trash' ORDER BY updated_at DESC").fetchall()
+
+
+@app.get('/api/projects/ownership')
+def project_ownership():
+    user=actor.get()
+    if not repository or user['role']!='admin': raise HTTPException(403,'需要管理员权限')
+    with repository.connection(user['id']) as conn:
+        return conn.execute("SELECT p.id,p.owner_id,u.username FROM projects p JOIN users u ON u.id=p.owner_id WHERE p.state='active' ORDER BY p.created_at").fetchall()
+
+
+@app.post('/api/projects/{project_id}/trash')
+def trash_project(project_id: str):
+    if not repository: raise HTTPException(503,'需要 PostgreSQL')
+    repository.move_state(project_id,actor.get()['id'],'trash')
+    return {'status':'trashed'}
+
+
+@app.post('/api/projects/{project_id}/restore')
+def restore_project(project_id: str):
+    if not repository: raise HTTPException(503,'需要 PostgreSQL')
+    user=actor.get()
+    repository.move_state(project_id,user['id'],'active')
+    with repository.connection(user['id']) as conn:
+        row=conn.execute('SELECT snapshot,source_path,data_version FROM projects WHERE id=%s',(project_id,)).fetchone()
+    with store.lock:
+        store.results[project_id]=ExtractionResult.from_dict(row['snapshot'])
+        store.data_versions[project_id]=row['data_version']
+        source=Path(row['source_path']) if row['source_path'] else None
+        if source and source.is_file(): store.pdf_paths[project_id]=source
+    return {'status':'active'}
+
+
+class TransferProject(BaseModel):
+    owner_id: str
+
+
+@app.post('/api/projects/{project_id}/transfer')
+def transfer_project(project_id: str,payload: TransferProject):
+    if not repository: raise HTTPException(503,'需要 PostgreSQL')
+    user=actor.get()
+    if user['role']!='admin': raise HTTPException(403,'需要管理员权限')
+    with repository.connection(user['id']) as conn:
+        target=conn.execute('SELECT id FROM users WHERE id=%s AND active=true',(payload.owner_id,)).fetchone()
+        if not target: raise HTTPException(404,'目标账号不存在或已停用')
+    repository.transfer(project_id,user['id'],target['id'])
+    return {'status':'transferred'}
+
+
+@app.get('/api/projects/{project_id}/revisions')
+def project_revisions(project_id: str):
+    if not repository: return []
+    return repository.revisions(project_id,actor.get()['id'])
+
+
+class RestoreRevision(BaseModel):
+    expected_version: int
+
+
+@app.post('/api/projects/{project_id}/revisions/{version}/restore')
+def restore_project_revision(project_id: str,version: int,payload: RestoreRevision):
+    if not repository: raise HTTPException(503,'需要 PostgreSQL')
+    try:
+        new_version=repository.restore_revision(project_id,actor.get()['id'],version,payload.expected_version)
+    except Conflict as exc: raise HTTPException(409,str(exc))
+    with repository.connection(actor.get()['id']) as conn:
+        row=conn.execute('SELECT snapshot FROM projects WHERE id=%s',(project_id,)).fetchone()
+    with store.lock:
+        store.results[project_id]=ExtractionResult.from_dict(row['snapshot'])
+        store.data_versions[project_id]=new_version
+    return {'status':'restored','data_version':new_version}
+
+
 @app.get("/api/project-load-errors")
 def project_load_errors():
     return getattr(store, "load_errors", {})
@@ -336,6 +540,12 @@ def project_load_errors():
 def clear_all_projects() -> Dict[str, Any]:
     if any(job["status"] in ("queued","running","reviewing","merging") for job in ai_jobs.jobs.values()):
         raise HTTPException(status_code=409, detail="请先取消正在运行的 AI 任务，再清空项目")
+    if store.repository:
+        user=actor.get()
+        if user['role']!='admin': raise HTTPException(403,'只有管理员可批量移入回收站')
+        for pid in store.repository.visible_ids(user['id']):
+            store.repository.move_state(pid,user['id'],'trash')
+        return {'status':'trashed','projects':[]}
     store.clear_all()
     return {"status": "cleared", "projects": []}
 
@@ -468,7 +678,13 @@ async def upload_pdf(file: UploadFile = File(...),workflow_mode: Annotated[Liter
     with store.lock:
         store.pdf_paths[proj_id] = saved_pdf
         store.results[proj_id] = res
-        store.sync_and_persist(proj_id)
+        try:
+            store.sync_and_persist(proj_id)
+        except Exception:
+            store.pdf_paths.pop(proj_id, None)
+            store.results.pop(proj_id, None)
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            raise
     _auto_start_ai(proj_id)
     return _serialize_project_response(proj_id)
 
@@ -1289,12 +1505,14 @@ def handle_review_action(project_id: str, review_id: str, payload: ReviewActionP
                                          bool(pdata.get('ai_brand_candidate_only')))
                 if rev.issue_type == 'AI_FIELD_CLASSIFICATION':
                     for field, expected in pdata.get('expected_values', {}).items():
-                        if field not in ('name', 'model', 'specification', 'brand') or getattr(target, field) != expected:
+                        if field not in ('name', 'model', 'specification', 'brand', 'component_parts') or getattr(target, field) != expected:
                             raise HTTPException(409, detail='AI 判读后物料已变化，请重新判读再采纳')
                 for field in ("brand", "model", "name", "unit"):
                     if field in pdata:
                         setattr(target, field, pdata[field])
                 if rev.issue_type == 'AI_FIELD_CLASSIFICATION':
+                    if 'component_parts' in pdata:
+                        target.component_parts = merge_parts(target.component_parts, pdata['component_parts'], confirmed=True)
                     if 'specification' in pdata:
                         target.specification = pdata['specification']
                     if 'model' in pdata:
@@ -1310,12 +1528,16 @@ def handle_review_action(project_id: str, review_id: str, payload: ReviewActionP
                                          'material_name':'device_description',
                                          'circuit_purpose':'device_annotation',
                                          'drawing_note':'device_annotation'}[role]
+                        if role in ('model', 'rating') and any(part['kind'] != 'main' and
+                                any(ev.get('span_id') == assignment['span_id'] and ev['role'] == role
+                                    for ev in part.get('evidences', [])) for part in pdata.get('component_parts', [])):
+                            evidence_role = 'component_model' if role == 'model' else 'component_specification'
                         existing = [ev for ev in target.evidences if ev.page == evidence_page and
                                     ev.raw_text.strip() == text.strip() and
                                     all(abs(a-b) < .003 for a,b in zip(ev.norm_bbox, box))]
                         if existing:
                             for ev in existing:
-                                if ev.role in ('model_text','model_candidate','device_description','device_annotation','specification'):
+                                if ev.role in ('model_text','model_candidate','component_model','component_specification','device_description','device_annotation','specification'):
                                     ev.role = evidence_role
                         else:
                             target.evidences.append(EvidenceLocation(evidence_page, _point_bbox(res, evidence_page, box),
@@ -1326,7 +1548,7 @@ def handle_review_action(project_id: str, review_id: str, payload: ReviewActionP
                     else:
                         conflict = next((other for other in res.review_items if other.id == f'rev_conflict_{target.tag}'
                                          and other.issue_type == 'PARAM_MISMATCH' and other.status == 'PENDING'), None)
-                        if conflict:
+                        if conflict and pdata.get('model'):
                             conflict.status = 'ACCEPTED'
                         target.review_note = '工程师已采纳千问的逐行文字归属判读；原文与位置证据已保留。'
                 target.source_type = SourceType.MANUAL_EDITED.value
@@ -1458,6 +1680,68 @@ def _field_reference_links(project_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _confirmed_field_memories(project_id: str, tag: str) -> List[Dict[str, Any]]:
+    if not repository: return []
+    with repository.connection(actor.get()['id']) as conn:
+        rows=conn.execute("SELECT id,version,content,confirmed_data_version FROM ai_memories WHERE project_id=%s AND status='active' AND applicability->>'tag'=%s ORDER BY confirmed_data_version DESC LIMIT 5",(project_id,tag)).fetchall()
+    return [{'id':str(row['id']),'version':row['version'],
+             'confirmed_data_version':row['confirmed_data_version'],
+             'confirmed_fields':{key:row['content'][key] for key in ('model','name','brand','specification') if key in row['content']}} for row in rows]
+
+
+def _record_field_analysis(project_id: str, item_id: str, fingerprint: str, input_version: int,
+                           memories: List[Dict[str, Any]], status: str, summary: Dict[str, Any] | None,
+                           usage: Dict[str, Any] | None, cache_hit: bool, started_at: float, error: str | None = None) -> None:
+    if not repository: return
+    user=actor.get()
+    with repository.connection(user['id']) as conn:
+        drawing=conn.execute('SELECT current_drawing_version FROM projects WHERE id=%s',(project_id,)).fetchone()
+        if not drawing: return
+        job_id=uuid.uuid4().hex
+        progress={'type':'field_classification','item_id':item_id,'status':status,'cache_hit':cache_hit}
+        conn.execute("INSERT INTO ai_jobs(id,project_id,input_data_version,drawing_version,requested_by,status,progress,heartbeat_at) VALUES(%s,%s,%s,%s,%s,%s,%s,now())",(job_id,project_id,input_version,drawing['current_drawing_version'],user['id'],status,json.dumps(progress,ensure_ascii=False)))
+        conn.execute("INSERT INTO ai_runs(id,job_id,project_id,input_fingerprint,drawing_version,input_data_version,model,model_config,prompt_version,rules_version,memory_versions,result_validation,usage,duration_ms,error) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",(uuid.uuid4(),job_id,project_id,fingerprint,drawing['current_drawing_version'],input_version,QWEN_MODEL,json.dumps({'cache_hit':cache_hit}),FIELD_CLASSIFIER_VERSION,'current',json.dumps([{'id':row['id'],'version':row['version']} for row in memories]),json.dumps(summary,ensure_ascii=False) if summary else None,json.dumps(usage or {}),int((time.time()-started_at)*1000),error[:300] if error else None))
+
+
+@app.post('/api/projects/{project_id}/bom/items/{item_id}/components/{component_id}/materialize')
+@serialized_mutation
+def materialize_component(project_id: str, item_id: str, component_id: str) -> Dict[str, Any]:
+    result = store.results.get(project_id)
+    if not result or table_policy(result):
+        raise HTTPException(404, detail='原理图项目不存在')
+    if any(pid == project_id and job['status'] in ('queued','running','reviewing','merging')
+           for (pid,_),job in ai_jobs.jobs.items()):
+        raise HTTPException(409, detail='AI 任务运行中，请结束后再补入采购部件')
+    parent = next((it for it in result.itemized_bom if it.id == item_id), None)
+    part = next((p for p in parent.component_parts if p.get('id') == component_id), None) if parent else None
+    if not part or part.get('kind') == 'main':
+        raise HTTPException(404, detail='独立部件不存在')
+    if part.get('status') != 'CONFIRMED' or not part.get('model') or not part.get('evidences'):
+        raise HTTPException(409, detail='请先核对并采纳部件型号与原图证据')
+    saved_id = part.get('materialized_item_id')
+    if saved_id:
+        if not any(it.id == saved_id for it in result.itemized_bom + result.filtered_items):
+            raise HTTPException(409, detail='该部件采购行已删除，保留人工删除决定；请通过新增物料重新补录')
+        return _serialize_project_response(project_id)
+    evidences = [EvidenceLocation(ev['page'], _point_bbox(result,ev['page'],ev['norm_bbox']), ev['norm_bbox'],
+                    raw_text=ev['raw_text'], role='model_text' if ev['role']=='model' else 'specification' if ev['role']=='rating' else 'device_annotation',
+                    device_tag=parent.tag) for ev in part['evidences']]
+    first = next((ev for ev in evidences if ev.role == 'model_text'), evidences[0])
+    child = BOMItem(id='component_' + uuid.uuid4().hex,seq_no=max((it.seq_no for it in result.itemized_bom),default=0)+1,
+        tag='',tags=[],name=part['name'],model=part['model'],raw_model=part['model'],
+        specification=part.get('specification',''),unit=part.get('unit') or '个',quantity=None,
+        source_type=SourceType.MANUAL_EDITED.value,entity_role='accessory',parent_tag=parent.tag,
+        primary_page=first.page,primary_bbox=first.norm_bbox,evidences=evidences,
+        procurement_scope=parent.procurement_scope,quantity_status='unknown',quantity_basis='component_quantity_unconfirmed',
+        model_origin='component_materialized',group_identity=parent.id+':'+component_id,needs_review=True,
+        review_note='工程师明确补入独立部件；采购数量仍须核定，未沿用本体数量。')
+    result.itemized_bom.append(child)
+    part['materialized_item_id']=child.id
+    part['relationship']='separate_part'
+    store.sync_and_persist(project_id)
+    return _serialize_project_response(project_id)
+
+
 @app.get('/api/projects/{project_id}/bom/items/{item_id}/classify-text/preview')
 def preview_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
     """Show the exact pixels the next single-item request would submit."""
@@ -1542,6 +1826,10 @@ def item_text_history(project_id: str, item_id: str) -> Dict[str, Any]:
 @app.post("/api/projects/{project_id}/bom/items/{item_id}/classify-text")
 def classify_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
     """Ask Qwen about one device; save a review proposal, never silently rewrite the BOM."""
+    started_at=time.time()
+    fingerprint=''
+    memories=[]
+    cache_hit=False
     with store.lock:
         res = store.results.get(project_id)
         if not res or project_id not in store.pdf_paths:
@@ -1557,15 +1845,18 @@ def classify_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
                         item.primary_page)
         if not 1 <= page_num <= res.page_count or page_num not in schematic_pages(res):
             raise HTTPException(409, detail="该物料缺少有效的原理图页面")
-        snapshot = {field:getattr(item,field) for field in ('name','model','specification','brand')}
+        snapshot = copy.deepcopy({field:getattr(item,field) for field in ('name','model','specification','brand','component_parts')})
+        input_version=store.data_versions.get(project_id,0)
         item_copy = copy.deepcopy(item)
         neighbors = copy.deepcopy(res.itemized_bom + res.filtered_items)
         page_infos = copy.deepcopy(res.pages)
         references = _field_reference_links(project_id)
+    memories=_confirmed_field_memories(project_id,item_copy.tag)
     try:
         with pymupdf.open(source) as doc:
             page = doc[page_num-1]
             context = build_context(page, item_copy, page_num, neighbors, doc, page_infos, references)
+            if memories: context['confirmed_project_memories']=memories
             fingerprint = analysis_fingerprint(source, context)
             cache_path = OUTPUT_DIR/project_id/'ai_field_cache'/(fingerprint+'.json')
             if cache_path.is_file():
@@ -1581,27 +1872,33 @@ def classify_item_text(project_id: str, item_id: str) -> Dict[str, Any]:
             summary['can_propose_brand'] = bool(summary.get('visual_brand_candidate') and not summary.get('brand')
                                                 and context.get('selection_status') != 'ambiguous')
     except ValueError as exc:
+        if fingerprint:_record_field_analysis(project_id,item_id,fingerprint,input_version,memories,'failed',None,None,cache_hit,started_at,str(exc))
         raise HTTPException(400, detail=str(exc)) from exc
     except RuntimeError as exc:
+        if fingerprint:_record_field_analysis(project_id,item_id,fingerprint,input_version,memories,'failed',None,None,cache_hit,started_at,str(exc))
         raise HTTPException(502, detail=str(exc)) from exc
     with store.lock:
         res = store.results.get(project_id)
         target = next((it for it in res.itemized_bom + res.filtered_items if it.id == item_id), None) if res else None
-        if not target or any(getattr(target,field) != value for field,value in snapshot.items()):
+        if not target or any(getattr(target,field) != value for field,value in snapshot.items()) or (repository and store.data_versions.get(project_id)!=input_version):
+            _record_field_analysis(project_id,item_id,fingerprint,input_version,memories,'stale',summary,usage,cache_hit,started_at,'判读期间项目已更新')
             raise HTTPException(409, detail="判读期间物料已变动，请重新运行")
+        _record_field_analysis(project_id,item_id,fingerprint,input_version,memories,'completed',summary,usage,cache_hit,started_at)
         review_id = 'rev_ai_fields_' + fingerprint[:20]
         review = next((r for r in res.review_items if r.id == review_id), None)
         proposal = None
-        if summary['can_propose_update'] or summary['can_propose_brand']:
-            brand_only = not summary['can_propose_update']
+        if summary['can_propose_update'] or summary['can_propose_brand'] or summary.get('can_propose_components'):
+            brand_only = not (summary['can_propose_update'] or summary.get('can_propose_components'))
             proposal = {'target_id':target.id,'expected_values':snapshot,
                         'ai_brand_candidate_only':brand_only}
             if not brand_only:
-                proposal.update({'model':summary['model'], 'assignments':[
+                proposal.update({'assignments':[
                     entry for entry in summary['assignments'] if
                     re.sub(r'\s+', '', (entry.get('owner_tag') or '')).upper() ==
                     re.sub(r'\s+', '', target.tag).upper()],
                     'name_source':summary['name_source']})
+                if summary['can_propose_update']: proposal['model'] = summary['model']
+                if summary.get('can_propose_components'): proposal['component_parts'] = summary['components']
                 for field in ('name','specification'):
                     if summary.get(field): proposal[field] = summary[field]
             if summary.get('brand') or summary.get('visual_brand_candidate'):

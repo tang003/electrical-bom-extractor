@@ -174,8 +174,8 @@ kbd { font-family:inherit; font-size:10px; color:#acb5c3; border:1px solid #e0e6
 .danger-text { color:#ba6864; }
 .danger-text:hover { background:#fff2f0; color:#b8413d; }
 .primary-table-scroll { scrollbar-width:thin; scrollbar-color:#c8d2e0 #f8fafd; overscroll-behavior:contain; }
-table.procurement-table { table-layout:fixed; min-width:680px; width:100%; max-width:1100px; font-size:12px; }
-.col-seq { width:36px; }.col-device { width:130px; }.col-model { width:auto; }.col-quantity { width:64px; }.col-status { width:105px; }.col-page { width:56px; }.col-actions { width:74px; }
+table.procurement-table { table-layout:fixed; min-width:540px; width:100%; font-size:12px; }
+.col-seq { width:30px; }.col-device { width:108px; }.col-model { width:auto; }.col-quantity { width:50px; }.col-status { width:76px; }.col-page { width:64px; }.col-actions { width:78px; }
 table.procurement-table th { font-size:11px; font-weight:550; height:31px; padding:6px 7px; background:#f7f9fc; color:#6e7f98; border-bottom:1px solid #e8edf5; }
 table.procurement-table td { padding:6px 7px; border-bottom:1px solid #edf0f5; vertical-align:middle; background:#fff; }
 table.procurement-table tbody tr:nth-child(even) td { background:#fcfdff; }
@@ -340,3 +340,31 @@ table.procurement-table .model-meta { margin-top:2px; font-size:9.5px; line-heig
 .workflow-options small {font-size:11px;color:#7d6c47;font-weight:normal;line-height:1.7;}
 .table-page-options {display:flex;gap:12px;flex-direction:column;margin:18px 0;font-size:13px;}
 @media(max-width:850px) {.workflow-notice-actions {flex-wrap:wrap;gap:6px;flex-shrink:1}.table-extraction-notice {flex-wrap:wrap}}
+
+/* Keep identity and the single editor entry visible in a narrow drawing split. */
+.list-scope-switch { display:inline-flex; flex-shrink:0; border:1px solid #dce4ef; border-radius:5px; padding:2px; background:#f4f7fc; }
+.list-scope-switch button { border:0; border-radius:3px; padding:4px 7px; font:inherit; font-size:11px; color:#6f7f96; background:transparent; cursor:pointer; white-space:nowrap; }
+.list-scope-switch button[aria-pressed="true"] { background:#fff; color:#2859d6; box-shadow:0 1px 3px #243b5a18; }
+.list-scope-switch button:focus-visible,.issue-action:focus-visible { outline:2px solid #2859d6; outline-offset:2px; }
+table.procurement-table th:first-child,table.procurement-table td:first-child { position:sticky; left:0; z-index:2; }
+table.procurement-table th:nth-child(2),table.procurement-table td:nth-child(2) { position:sticky; left:30px; z-index:2; box-shadow:3px 0 5px -4px #7387a5; }
+table.procurement-table th:last-child,table.procurement-table td:last-child { position:sticky; right:0; z-index:2; box-shadow:-3px 0 5px -4px #7387a5; }
+table.procurement-table th:first-child,table.procurement-table th:nth-child(2),table.procurement-table th:last-child { z-index:12; }
+table.procurement-table .drawing-annotation-summary,table.procurement-table .spec-line { -webkit-line-clamp:1; font-size:10px; line-height:1.4; }
+table.procurement-table .model-meta { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:block; }
+table.procurement-table .source-dot { vertical-align:middle; margin-right:4px; }
+table.procurement-table .page-link { overflow-wrap:anywhere; text-align:left; line-height:1.4; }
+.issue-action { font-family:inherit; cursor:pointer; }
+.issue-action:hover { filter:brightness(.96); text-decoration:underline; }
+.editor-source { margin-top:24px; padding-top:20px; border-top:1px solid #edf1f6; }
+.item-panel button:disabled { cursor:default; opacity:.5; }
+.table-footer { flex-wrap:wrap; gap:5px 12px; }
+@media(min-width:1600px) { .col-device { width:140px; }.col-status { width:96px; }.col-quantity { width:62px; } }
+
+.component-section { margin-top:22px; padding-top:18px; border-top:1px solid #edf1f6; outline-offset:4px; }
+.component-card { margin:9px 0; padding:11px; border:1px solid #dfe7f2; border-radius:6px; background:#f8fafd; color:#536b8b; font-size:11px; }
+.component-card-heading { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px; }
+.component-card code { font:600 12px Consolas,monospace; color:#344962; overflow-wrap:anywhere; }
+.component-card p { margin:5px 0; line-height:1.7; overflow-wrap:anywhere; }
+.component-evidence { display:flex; flex-wrap:wrap; gap:4px 12px; }.component-evidence .page-link { text-align:left; }
+table.procurement-table .component-summary { padding:2px 0; font-size:10px; }

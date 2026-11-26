@@ -9,6 +9,7 @@ import pymupdf
 from .classifier import extract_visual_spans
 from .cad_import import cad_join_tag_fragments
 from .cad_rack import read_rack
+from .component_names import owned_name, printed_device_caption, resistor_parameters
 from .models import BOMItem, ReviewItem, EvidenceLocation, SourceType, PageInfo, PageType
 from .vision import VisionRecognizer
 from .ocr_engine import DualChannelOCREngine
@@ -130,7 +131,7 @@ def _infer_component_name_and_brand(tag: str, model: str, nearby_texts: List[str
     if t == "P":
         return "仪表", brand
     if t == "E":
-        return "照明/加热元件", brand
+        return "电气元器件（类型待核）", brand
     if t == 'L':
         return ('电流互感器' if any('S1' in text or 'S2' in text for text in nearby_texts) else '电感/互感器（待核实）'), brand
     if t.startswith('X'):
@@ -460,7 +461,7 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
         name,brand=_infer_component_name_and_brand(tag,model,near)
         labels = descriptions.get(tag, [])
         explicit_names = {"漏电保护断路器" if re.fullmatch(r'(?:[A-Z]+\+)?RCBO', span['text'], re.I)
-                          else span['text'] for _,span in labels}
+                          else printed_device_caption(span['text']) or span['text'] for _,span in labels}
         preferred_name = _preferred_device_caption(list(explicit_names))
         if preferred_name:
             name = preferred_name
@@ -473,6 +474,14 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
                        and ev.bbox==span['bbox'] for ev in evidences):
                 evidences.append(EvidenceLocation(page_num, span['bbox'], span['norm_bbox'],
                                                   raw_text=text, role='device_annotation', device_tag=tag))
+        owned = [ev.raw_text for ev in evidences if ev.role in ('device_description', 'device_annotation')
+                 and ev.device_tag == tag]
+        printed_name = owned_name(tag, owned)
+        if printed_name:
+            name = printed_name
+        if name.endswith('（类型待核）'):
+            needs_review = True
+            note = (note + ' 器件类型尚未由明确名称确认，请核对原图。').strip()
         if name == "开关器件（型式待核）":
             needs_review = True
             note = "已读到开关型号，原图文字未明确具体开关型式，按订货号核实。"
@@ -524,6 +533,15 @@ def extract_from_schematic_pdf(doc, pages_info, rules_config, crops_dir=None, in
                 if sp['text'] not in parameters:
                     parameters.append(sp['text'])
                     item.evidences.append(EvidenceLocation(pno,sp['bbox'],sp['norm_bbox'],raw_text=sp['text'],role='specification',device_tag=tag))
+        if code == 'R' or re.search(r'电阻器?$', name):
+            for ev in list(item.evidences):
+                if ev.device_tag != tag or ev.role not in ('device_description', 'device_annotation'):
+                    continue
+                rating = resistor_parameters(ev.raw_text)
+                if rating and rating not in parameters:
+                    parameters.append(rating)
+                    item.evidences.append(EvidenceLocation(ev.page, ev.bbox, ev.norm_bbox,
+                                                          raw_text=rating, role='specification', device_tag=tag))
         item.specification='；'.join(parameters)
         if code.startswith('X'):
             item.entity_role='device' if 'POL' in item.specification.upper() else 'terminal'
@@ -599,21 +617,14 @@ def _extract_wires_and_terminals(
          printed above every pin.
       3. Resolve each pin's wire label on MAIN_CIRCUIT pages and attach the nearest gauge annotation
          (same column first, then Euclidean). Pins without a resolvable gauge are control pins.
-      4. Map gauge -> terminal rating and estimate wire meters from conductor counts × cabinet size,
-         all via `wire_terminal_estimation` in rules_config.json. Everything is tagged ESTIMATED_AUX.
+      4. Map gauge -> terminal rating via `wire_terminal_estimation` in rules_config.json.
+         Terminal estimates stay tagged ESTIMATED_AUX; wire lengths are never estimated.
     """
     cfg = (rules_config or {}).get("wire_terminal_estimation", {})
     rating_map: Dict[str, str] = cfg.get("gauge_to_terminal_rating", {})
     control_rating: str = cfg.get("control_terminal_rating", "16A")
     term_spare: float = float(cfg.get("terminal_spare_ratio", 0.0))
-    wire_spare: float = float(cfg.get("wire_spare_ratio", 0.1))
-    route_factor: float = float(cfg.get("route_factor", 1.0))
-    conductors_per_annotation: int = int(cfg.get("conductors_per_unmapped_annotation", 3))
-    control_gauge: str = cfg.get("control_wire_gauge", "1mm²")
-    control_runs_per_device: float = float(cfg.get("control_runs_per_device", 2.0))
     incoming_poles: int = int(cfg.get("incoming_terminal_poles", 0))
-    default_cab = cfg.get("default_cabinet_mm", [1600, 800, 400])
-    wire_brand: str = cfg.get("wire_brand", "")
     terminal_brand: str = cfg.get("terminal_brand", "")
 
     items: List[BOMItem] = []
@@ -759,59 +770,8 @@ def _extract_wires_and_terminals(
             pin_gauge_counts[g] = pin_gauge_counts.get(g, 0) + 1
             prev_g = g
 
-    # ---- 4. Cabinet size for wire run length ----
-    cab = list(default_cab)
-    cab_from_drawing = False
-    for vf in vector_findings or []:
-        if vf.get("type") == "CABINET_DIMENSION":
-            nums = [int(n) for n in re.findall(r"\d{3,4}", str(vf.get("model", "")))]
-            if len(nums) >= 2:
-                cab = nums[:3] + list(default_cab)[len(nums[:3]):]
-                cab_from_drawing = True
-                break
-    per_run_m = (cab[0] + cab[1]) / 1000.0 * route_factor
-    cab_note = f"柜体 {cab[0]}×{cab[1]}mm{'(图纸识别)' if cab_from_drawing else '(配置默认值)'}"
-
-    # ---- 5. Wire items ----
+    # Wire gauges remain evidence for terminal sizing, never an estimated wire BOM.
     gauges_found = sorted({gm["gauge"] for gm in gauge_marks}, key=_gv, reverse=True)
-    for g in gauges_found:
-        evs_g = [EvidenceLocation(page=gm["page"], bbox=gm["bbox"], norm_bbox=gm["norm_bbox"],
-                                  raw_text=gm["raw"], role="wire_gauge") for gm in gauge_marks if gm["gauge"] == g]
-        mapped = len(conductors_by_gauge.get(g, set()))
-        n_cond = mapped if mapped > 0 else len(evs_g) * conductors_per_annotation
-        meters = math.ceil(n_cond * per_run_m * (1.0 + wire_spare))
-        basis = (f"端子图关联到 {mapped} 根 {g} 导线" if mapped
-                 else f"图纸 {len(evs_g)} 处 {g} 标注 × 每处 {conductors_per_annotation} 根")
-        seq += 1
-        items.append(BOMItem(
-            id=f"wire_{seq}", seq_no=seq, tag=f"W-{g}", tags=[f"W-{g}"], placement="",
-            name="导线", model=g, raw_model=g, brand=wire_brand, unit="米", quantity=float(meters),
-            remark=f"估算：{basis} × {per_run_m:.2f}m/根 × (1+{wire_spare:.0%})",
-            pdf_page_label=", ".join(f"第{p}页" for p in sorted({e.page for e in evs_g})),
-            primary_page=evs_g[0].page, primary_bbox=evs_g[0].norm_bbox, evidences=evs_g,
-            source_type=SourceType.ESTIMATED_AUX.value, category="auxiliary", needs_review=True,
-            review_note=f"线径为图纸明文；米数为工程估算（{cab_note}），请工程师确认",
-        ))
-
-    ctrl_pages = [p.page_num for p in pages_info if p.page_type == PageType.CONTROL_CIRCUIT.value]
-    if ctrl_pages and control_gauge not in gauges_found:
-        n_cond = control_pins + int(control_device_count * control_runs_per_device)
-        if n_cond > 0:
-            meters = math.ceil(n_cond * per_run_m * (1.0 + wire_spare))
-            nb = [0.10, 0.15, 0.85, 0.75]
-            seq += 1
-            items.append(BOMItem(
-                id=f"wire_{seq}", seq_no=seq, tag=f"W-{control_gauge}", tags=[f"W-{control_gauge}"], placement="",
-                name="导线", model=control_gauge, raw_model=control_gauge, brand=wire_brand, unit="米",
-                quantity=float(meters),
-                remark=(f"估算：({control_pins} 个控制端子 + {control_device_count} 个控制元件×{control_runs_per_device:g}) "
-                        f"× {per_run_m:.2f}m × (1+{wire_spare:.0%})"),
-                pdf_page_label=f"第{ctrl_pages[0]}~{ctrl_pages[-1]}页", primary_page=ctrl_pages[0], primary_bbox=nb,
-                evidences=[EvidenceLocation(page=ctrl_pages[0], bbox=[0, 0, 100, 100], norm_bbox=nb,
-                                            raw_text=f"控制回路 {control_gauge}", role="control_wire_estimate")],
-                source_type=SourceType.ESTIMATED_AUX.value, category="auxiliary", needs_review=True,
-                review_note=f"控制回路图纸未标线径，按配置 {control_gauge} 估算（{cab_note}），请工程师确认",
-            ))
 
     # ---- 6. Terminal items grouped by rating ----
     by_rating: Dict[str, Dict[str, Any]] = {}
@@ -869,11 +829,11 @@ def _extract_wires_and_terminals(
                                                    norm_bbox=gauge_marks[0]["norm_bbox"], raw_text="", role="")])[0]
         reviews.append(ReviewItem(
             id="rev_wires_terminals_summary", severity="INFO", issue_type="RULE_APPLIED",
-            tag="端子 / 导线",
-            title=f"端子与导线估算：{len(gauges_found)} 种明文线径，端子图共 {total_pins} 位（控制位 {control_pins}）",
-            description=(f"线径 {gauges_found}；端子排 {strip_summary}。端子规格与导线米数为按 rules_config.json "
+            tag="端子",
+            title=f"端子规格与数量核对：{len(gauges_found)} 种明文线径，端子图共 {total_pins} 位（控制位 {control_pins}）",
+            description=(f"线径 {gauges_found}；端子排 {strip_summary}。端子规格为按 rules_config.json "
                          f"`wire_terminal_estimation` 的工程估算，非图纸明文。"),
-            suggestion="请工程师核对端子规格映射与米数估算，可在【选型规则库】调整系数。",
+            suggestion="请工程师核对端子规格映射与片数；不生成导线米数估算。",
             page=first_ev.page, norm_bbox=first_ev.norm_bbox, status="PENDING", action_type="CONFIRM",
         ))
 
