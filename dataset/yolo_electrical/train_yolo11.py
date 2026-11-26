@@ -16,7 +16,8 @@ def main():
 
     ds_dir = Path(__file__).resolve().parent
     data_yaml = ds_dir / "data.yaml"
-    if not (ds_dir / "train.txt").read_text(encoding="utf-8").strip() or not (ds_dir / "val.txt").read_text(encoding="utf-8").strip():
+    train_list, val_list = ds_dir / "train.txt", ds_dir / "val.txt"
+    if not train_list.is_file() or not val_list.is_file() or not train_list.read_text(encoding="utf-8").strip() or not val_list.read_text(encoding="utf-8").strip():
         raise ValueError("训练前至少需要两个独立项目的已确认符号样本，分别用于训练和验证")
     model = YOLO("yolo11n.pt")
     model.train(data=str(data_yaml), epochs=50, imgsz=640, batch=8, project=str(ds_dir / "runs"), name="electrical_yolo11")

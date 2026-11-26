@@ -1,6 +1,6 @@
-path: D:/project/electrical-bom-extractor/dataset/yolo_electrical
-train: images/train
-val: images/train
+path: "D:/project/electrical-bom-extractor/dataset/yolo_electrical"
+train: train.txt
+val: val.txt
 
 names:
   0: circuit_breaker
