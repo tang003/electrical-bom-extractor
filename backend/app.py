@@ -34,6 +34,7 @@ from bom_extractor.components import merge_parts
 from bom_extractor.models import ExtractionResult, BOMItem, EvidenceLocation, SourceType, ReviewItem
 from bom_extractor.pipeline import run_extraction_pipeline
 from bom_extractor.rules import build_aggregated_from_itemized, load_rules_config
+from bom_extractor.scope_rules import apply_scope_defaults, infer_procurement_scope
 from bom_extractor.exporter import export_to_excel, export_to_json
 from bom_extractor.evaluator import evaluate_extraction
 from bom_extractor.vision import VisionRecognizer
@@ -373,6 +374,7 @@ def _serialize_project_response(proj_id: str) -> Dict[str, Any]:
     res = store.results[proj_id]
     data = res.to_dict()
     if store.repository: data['data_version']=store.data_versions.get(proj_id)
+    data['scope_default_candidates'] = sum(infer_procurement_scope(item) is not None for item in res.itemized_bom) if res.extraction_mode == 'SCHEMATIC_MODE' else 0
     from bom_extractor.procurement import item_readiness, procurement_summary
     for key in ('itemized_bom','aggregated_bom','filtered_items'):
         for raw,item in zip(data[key],getattr(res,key)):
@@ -1028,6 +1030,7 @@ def update_bom_item(project_id: str, payload: BOMItemUpdatePayload) -> Dict[str,
             if 'model' in fields and it.model!=payload.model:it.model_origin='manual'
             for field_name in fields:
                 setattr(it, field_name, getattr(payload, field_name))
+            if 'procurement_scope' in fields:it.procurement_scope_basis='manual'
             it.source_type = SourceType.MANUAL_EDITED.value
             it.needs_review = False
         if not quantity_supplied:
@@ -1064,6 +1067,7 @@ def update_bom_item(project_id: str, payload: BOMItemUpdatePayload) -> Dict[str,
         if 'model' in fields and found.model!=payload.model:found.model_origin='manual'
         for field_name in fields + (("quantity",) if quantity_supplied else ()):
             setattr(found, field_name, getattr(payload, field_name))
+        if 'procurement_scope' in fields:found.procurement_scope_basis='manual'
         if 'tag' in payload.model_fields_set:
             found.tag = payload.tag
             found.tags = [t.strip() for t in re.split(r"[,，、]+", payload.tag) if t.strip()]
@@ -1074,6 +1078,22 @@ def update_bom_item(project_id: str, payload: BOMItemUpdatePayload) -> Dict[str,
             found.quantity_basis='manual_confirmation'
     store.sync_and_persist(project_id)
     return _serialize_project_response(project_id)
+
+
+@app.post('/api/projects/{project_id}/procurement-scope/infer')
+@serialized_mutation
+def infer_project_procurement_scope(project_id: str) -> Dict[str, Any]:
+    if project_id not in store.results:
+        raise HTTPException(404, '项目不存在')
+    result = store.results[project_id]
+    if result.extraction_mode != 'SCHEMATIC_MODE' or not load_rules_config(RULES_PATH).get('filter_rules', {}).get('exclude_field_loads_in_schematic', True):
+        raise HTTPException(409, '当前项目没有启用柜内采购默认规则')
+    changed = apply_scope_defaults(result.itemized_bom)
+    if changed:
+        store.sync_and_persist(project_id)
+    response = _serialize_project_response(project_id)
+    response['scope_inferred'] = changed
+    return response
 
 
 class BOMItemCreatePayload(BaseModel):

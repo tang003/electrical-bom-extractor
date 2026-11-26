@@ -284,6 +284,7 @@ createApp({
     const sourceFilter = ref("ALL");
     const categoryFilter = ref("ALL"); // "ALL" | "PRIMARY" | "AUX"
     const issueFilter = ref('ALL');
+    const scopeBusy = ref(false);
     const reviewStatusFilter = ref('PENDING');
     const expandedReview = ref('');
 
@@ -1441,6 +1442,14 @@ createApp({
     function scopeLabel(value) { return {cabinet:'柜内采购',field:'现场采购',unknown:'范围待核',excluded:'不在采购范围'}[value] || '范围待核'; }
     function roleLabel(value) { return {device:'独立器件',coil:'线圈 / 器件',contact:'仅触点',terminal:'端子材料',cable:'电缆材料',assembly:'成套 / 组件待核',accessory:'附件'}[value] || '独立器件'; }
     function evidencePages(item) { return [...new Set((item.evidences || []).map(e => e.page))]; }
+    function terminalPageQuantity(item) {
+      if (!pageOrderActive.value || item.entity_role !== 'terminal' ||
+          item.quantity_basis !== 'drawn_terminal_positions' || item.quantity == null) return null;
+      const symbols=(item.evidences || []).filter(ev=>ev.role==='terminal_symbol' && hasDrawingBox(ev.norm_bbox));
+      if (new Set(symbols.map(ev=>ev.page)).size<2) return null;
+      return new Set(symbols.filter(ev=>ev.page===currentPage.value)
+        .map(ev=>ev.norm_bbox.join(','))).size || null;
+    }
     const drawingAnnotationRoles={main_circuit:'位号',device_description:'器件说明',device_annotation:'功能 / 接口说明',model_text:'原图型号',model_candidate:'型号线索',specification:'技术参数'};
     function drawingAnnotations(item) {
       if (!item) return [];
@@ -1459,6 +1468,18 @@ createApp({
       const notes=drawingAnnotations(item).filter(ev=>['device_description','device_annotation'].includes(ev.role))
         .map(ev=>ev.raw_text.trim()).filter(Boolean);
       return [...new Set(notes)].join('；');
+    }
+    async function copyAnnotationText(value) {
+      try {
+        await navigator.clipboard.writeText(value);
+        showToast('原图文字已复制');
+      } catch (_) {
+        showToast('复制失败，请选中文字后手动复制');
+      }
+    }
+    function copyAllDrawingAnnotations(item) {
+      const lines=drawingAnnotations(item).map(line=>`${line.annotation_label}：${line.raw_text.trim()}`);
+      if (lines.length) return copyAnnotationText(lines.join('\n'));
     }
     function hasDistinctSpecification(item) {
       const normalize=value=>String(value || '').normalize('NFKC').replace(/\s+/g,'').toUpperCase();
@@ -1966,6 +1987,23 @@ createApp({
       return true;
     }
 
+    async function inferProjectScope() {
+      if (!displayedProjectIsCurrent() || scopeBusy.value || editDirty.value || savingEdit.value) return;
+      scopeBusy.value = true;
+      try {
+        const response = await fetch(`/api/projects/${currentProjectId.value}/procurement-scope/infer`, {method:'POST'});
+        const data = await response.json();
+        if (!response.ok) { showToast(data.detail || '采购范围判定失败'); return; }
+        if (!applyProjectResponse(data)) return;
+        clearActiveBox();
+        showToast(`已按项目规则补齐 ${data.scope_inferred} 项采购范围；其余仍需人工核对。`);
+      } catch (_) {
+        showToast('采购范围判定失败，请稍后重试');
+      } finally {
+        scopeBusy.value = false;
+      }
+    }
+
     async function applySelection(item, suggestion, action) {
       if (!displayedProjectIsCurrent() || editDirty.value || savingEdit.value) return;
       const id = item.member_ids?.length === 1 ? item.member_ids[0] : item.id;
@@ -2385,7 +2423,7 @@ createApp({
       showCadSheets, cadSelectedPages, createCadSelection,
       leftPaneWidth,
       workspaceMode, setWorkspaceMode, overviewExpanded, toggleOverview, issueFilter, issueLabels, issueCounts, focusIssue, resetFilters, filtersActive,
-      needsModel, modelPendingLabel, hasPendingComponents, componentLabel, componentEvidence, materializeComponent, itemIssues, scopeLabel, roleLabel, evidencePages, itemDrawingReference, matchesIssue, hasDistinctSpecification, drawingAnnotations, drawingAnnotationSummary,
+      needsModel, modelPendingLabel, hasPendingComponents, componentLabel, componentEvidence, materializeComponent, itemIssues, scopeLabel, scopeBusy, inferProjectScope, roleLabel, evidencePages, terminalPageQuantity, itemDrawingReference, matchesIssue, hasDistinctSpecification, drawingAnnotations, drawingAnnotationSummary, copyAnnotationText, copyAllDrawingAnnotations,
       reviewStatusFilter, visibleReviews, awaitingFirstBom, pagesToCheck, expandedReview, unboundLocations, detailItemId, drawerItem, savingEdit, editDirty, editTargetChanged,
       fieldClassification, fieldClassificationBusy, fieldClassificationError, fieldClassificationTarget, classifyDrawingText, acceptFieldClassification,
       fieldHistory, fieldHistoryBusy, fieldHistoryError, formatFieldRecordTime, showFieldRecord,

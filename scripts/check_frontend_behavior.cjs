@@ -544,6 +544,12 @@ const response = data=>({ok:true,json:async()=>data});
   assert.deepEqual(Array.from(app.drawingAnnotations(axisCard),line=>line.raw_text),
     ['-AX1515N','4轴数字量轴卡','S轴命令端口','CK3W_AX1515N']);
   assert.equal(app.drawingAnnotationSummary(axisCard),'4轴数字量轴卡；S轴命令端口');
+  let copied='';
+  context.navigator={clipboard:{writeText:async value=>{copied=value;}}};
+  await app.copyAllDrawingAnnotations(axisCard);
+  assert.equal(copied,'位号：-AX1515N\n器件说明：4轴数字量轴卡\n功能 / 接口说明：S轴命令端口\n原图型号：CK3W_AX1515N');
+  await app.copyAnnotationText('24VDC');
+  assert.equal(copied,'24VDC','A single annotation can be copied without navigating to the PDF');
   const printedGrid=Array.from({length:10},(_,number)=>({number,x:.065+number*.088}));
   const km2={...somItem('km2','-KM2'),evidences:[
     {page:2,role:'main_circuit',norm_bbox:[.44,.65,.48,.69],raw_text:'-KM2'},

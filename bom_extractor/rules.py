@@ -56,6 +56,7 @@ def build_aggregated_from_itemized(itemized_items: List[BOMItem]) -> List[BOMIte
             from .components import merge_parts
             agg.component_parts = merge_parts(agg.component_parts, it.component_parts)
             if agg.model_origin!=it.model_origin:agg.model_origin='mixed'
+            if agg.procurement_scope_basis!=it.procurement_scope_basis:agg.procurement_scope_basis='mixed'
             agg.parts_reference_id=','.join(dict.fromkeys(filter(None,[*agg.parts_reference_id.split(','),it.parts_reference_id])))
             if it.needs_review:
                 agg.needs_review = True
@@ -131,4 +132,7 @@ def apply_engineering_rules(
             tag=", ".join(it.tag for it in series), title=f"{len(series)} 项企业选型规则补全待确认",
             description="型号或附件来自企业配置，请逐项核实", suggestion="核实电压、颜色、触点和附件规格",
             page=series[0].primary_page, norm_bbox=series[0].primary_bbox))
+    if extraction_mode == 'SCHEMATIC_MODE' and filter_cfg.get('exclude_field_loads_in_schematic', True):
+        from .scope_rules import apply_scope_defaults
+        apply_scope_defaults(kept)
     return kept, build_aggregated_from_itemized(kept), filtered, reviews

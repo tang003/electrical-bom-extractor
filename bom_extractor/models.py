@@ -97,6 +97,7 @@ class BOMItem:
     entity_role: str = "device"             # device | coil | contact | terminal | cable | assembly
     parent_tag: str = ""                    # Evidence-backed assembly/component relationship
     procurement_scope: str = "unknown"      # cabinet | field | unknown | excluded
+    procurement_scope_basis: str = ""        # project_cabinet_default | drawing_field_load | manual
     quantity_status: str = "by_tag"         # by_tag | confirmed | unknown | needs_confirmation
     quantity_basis: str = "unique_tag"
     quantity_candidates: List[float] = field(default_factory=list)
