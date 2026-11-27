@@ -882,18 +882,19 @@
           </section>
           <section v-else class="ai-config-section" role="tabpanel">
             <p class="ai-config-description">在物料详情中点击“判读此位号的图纸文字”时调用。发送主位置与必要的同位号引用裁图，以及带页码、坐标的原文，先生成审核建议；不会因上传图纸自动运行，也不修改采购数量。</p>
-            <div class="ai-config-current"><span>固定视觉模型</span><strong>qwen3-vl-plus</strong><small>阿里云百炼 · {{ qwenHasKey ? '密钥已配置' : '密钥未配置' }}</small></div>
-            <div class="form-field"><label>阿里云百炼 API Key</label><input type="password" v-model="qwenKeyValue" @input="qwenTestResult=null" autocomplete="new-password" :placeholder="qwenHasKey ? '已配置，留空保留原密钥' : '输入百炼 API Key'" /></div>
+            <div class="ai-config-current"><span>固定视觉模型</span><strong>qwen3-vl-plus</strong><small>阿里云百炼 · {{ qwenKeyEditable ? (qwenHasKey ? '密钥已配置' : '密钥未配置') : (qwenHasKey ? '服务器密钥已配置' : '服务器密钥未配置') }}</small></div>
+            <div v-if="qwenKeyEditable" class="form-field"><label>阿里云百炼 API Key</label><input type="password" v-model="qwenKeyValue" @input="qwenTestResult=null" autocomplete="new-password" :placeholder="qwenHasKey ? '已配置，留空保留原密钥' : '输入百炼 API Key'" /></div>
+            <p v-else class="ai-config-hint">{{ qwenHasKey ? '密钥由服务器配置，可直接使用单物料文字判读。' : '服务器尚未配置密钥，请管理员设置 DASHSCOPE_API_KEY。' }}</p>
             <div class="ai-config-test"><button type="button" class="btn btn-light btn-sm" :disabled="qwenTestBusy || (!qwenHasKey && !qwenKeyValue.trim())" @click="testQwenConnection">{{ qwenTestBusy ? '正在测试…' : '测试连通性' }}</button><span v-if="qwenTestResult" class="ai-config-test-ok" role="status">✓ {{ qwenTestResult.source }} Key 已通过图片请求测试 · {{ qwenTestResult.model }}</span></div>
             <p class="ai-config-hint">测试会发送一张临时色块图并产生一次少量计费的调用，不会上传项目图纸。</p>
-            <p class="ai-config-hint">这把 Key 单独保存，不会更改上方“整份 / 本页识别”的模型或密钥。<span v-if="qwenKeySource === 'environment'">当前由 DASHSCOPE_API_KEY 环境变量供给；环境变量会优先于此处保存的 Key。</span></p>
+            <p v-if="qwenKeyEditable" class="ai-config-hint">这把 Key 单独保存，不会更改上方“整份 / 本页识别”的模型或密钥。<span v-if="qwenKeySource === 'environment'">当前由 DASHSCOPE_API_KEY 环境变量供给；环境变量会优先于此处保存的 Key。</span></p>
           </section>
           <p v-if="aiConfigError" class="task-error" role="alert">{{ aiConfigError }}</p>
         </div>
         <div class="modal-footer">
           <button class="btn btn-light" @click="showVlmModal = false">关闭</button>
           <button v-if="aiConfigTab === 'page'" class="btn btn-primary" @click="saveVlmConfig">保存整页识别配置</button>
-          <button v-else class="btn btn-primary" :disabled="!qwenKeyValue.trim() || qwenKeySaving" @click="saveQwenKey">{{ qwenKeySaving ? '保存中…' : '保存千问 Key' }}</button>
+          <button v-else-if="qwenKeyEditable" class="btn btn-primary" :disabled="!qwenKeyValue.trim() || qwenKeySaving" @click="saveQwenKey">{{ qwenKeySaving ? '保存中…' : '保存千问 Key' }}</button>
         </div>
       </div>
     </div>

@@ -1594,6 +1594,7 @@ createApp({
     const qwenKeyValue = ref('');
     const qwenHasKey = ref(false);
     const qwenKeySource = ref('none');
+    const qwenKeyEditable = ref(true);
     const qwenKeySaving = ref(false);
     const qwenTestBusy = ref(false);
     const qwenTestResult = ref(null);
@@ -1601,7 +1602,7 @@ createApp({
       await openVlmModal('item');
     }
     async function saveQwenKey() {
-      if (!qwenKeyValue.value.trim() || qwenKeySaving.value) return;
+      if (!qwenKeyEditable.value || !qwenKeyValue.value.trim() || qwenKeySaving.value) return;
       qwenKeySaving.value=true;
       try {
         const response=await fetch('/api/qwen-config',{method:'PUT',headers:{'Content-Type':'application/json'},
@@ -1617,14 +1618,14 @@ createApp({
     async function testQwenConnection() {
       if (qwenTestBusy.value || (!qwenHasKey.value && !qwenKeyValue.value.trim())) return;
       qwenTestBusy.value=true;qwenTestResult.value=null;aiConfigError.value='';
-      const testingInput=Boolean(qwenKeyValue.value.trim());
+      const testingInput=qwenKeyEditable.value && Boolean(qwenKeyValue.value.trim());
       try {
         const response=await fetch('/api/qwen-config/test',{method:'POST',
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({api_key:testingInput ? qwenKeyValue.value.trim() : null})});
         const data=await response.json();
         if (!response.ok) throw new Error(data.detail || '连通性测试失败');
-        qwenTestResult.value={model:data.model || 'qwen3-vl-plus',source:testingInput ? '当前输入' : '已保存'};
+        qwenTestResult.value={model:data.model || 'qwen3-vl-plus',source:testingInput ? '当前输入' : qwenKeySource.value === 'environment' ? '服务器' : '已保存'};
       } catch (error) {aiConfigError.value=error.message || '连通性测试失败';}
       finally {qwenTestBusy.value=false;}
     }
@@ -2346,7 +2347,12 @@ createApp({
       qwenTestResult.value=null;
       const [pageResponse,itemResponse]=await Promise.all([fetch('/api/vlm-config'),fetch('/api/qwen-config')]);
       if (pageResponse.ok) vlmForm.value=await pageResponse.json();
-      if (itemResponse.ok) {const itemConfig=await itemResponse.json();qwenHasKey.value=itemConfig.has_api_key;qwenKeySource.value=itemConfig.key_source || 'none';}
+      if (itemResponse.ok) {
+        const itemConfig=await itemResponse.json();
+        qwenHasKey.value=Boolean(itemConfig.has_api_key);
+        qwenKeySource.value=itemConfig.key_source || 'none';
+        qwenKeyEditable.value=itemConfig.can_edit !== false;
+      }
       showVlmModal.value = true;
     }
 
@@ -2458,7 +2464,7 @@ createApp({
       fieldClassification, fieldClassificationBusy, fieldClassificationError, fieldClassificationTarget, classifyDrawingText, acceptFieldClassification,
       fieldHistory, fieldHistoryBusy, fieldHistoryError, formatFieldRecordTime, showFieldRecord,
       fieldPreview, fieldPreviewBusy, previewDrawingText,
-      qwenKeyValue, qwenHasKey, qwenKeySource, qwenKeySaving, qwenTestBusy, qwenTestResult,
+      qwenKeyValue, qwenHasKey, qwenKeySource, qwenKeyEditable, qwenKeySaving, qwenTestBusy, qwenTestResult,
       openQwenKeyEditor, saveQwenKey, testQwenConnection,
       openItemDetails, openItemIssue, tableCountLabel, closeItemPanel, locateItem, locateItemEvidence, deletePanelItem, closeToolsMenu,
       evidencePreviewIndex, evidencePreview, evidencePreviewError, toggleEvidencePreview,

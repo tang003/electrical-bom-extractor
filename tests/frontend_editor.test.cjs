@@ -5,14 +5,19 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '..');
 
-function editor() {
+function editor({qwenConfig=null}={}) {
   let state, focused, payload;
+  const requests=[];
   const context = vm.createContext({console, URLSearchParams, setTimeout:()=>0, clearTimeout:()=>{},
     localStorage:{getItem:()=>null, setItem:()=>{}},
     document:{createElement:()=>({}), activeElement:null, querySelector:()=>({focus:()=>{focused='name';}}),
       getElementById:id=>({focus:()=>{focused=id;}})},
     confirm:()=>false,
     fetch:async (url, options) => {
+      requests.push({url, method:options?.method || 'GET'});
+      if (url === '/api/qwen-config' && !options) {
+        return {ok:true, json:async()=>qwenConfig || {has_api_key:false,key_source:'none',can_edit:true}};
+      }
       if (options?.method === 'PUT') {
         payload = JSON.parse(options.body);
         const project = JSON.parse(JSON.stringify(state.projectData.value));
@@ -34,8 +39,19 @@ function editor() {
   state.activeTab.value='secondary';
   state.followDrawingPage.value=false;
   state.currentPage.value=8;
-  return {state,item,context,get focused(){return focused;},get payload(){return payload;}};
+  return {state,item,context,requests,get focused(){return focused;},get payload(){return payload;}};
 }
+
+test('server-managed Qwen key is read-only in the configuration dialog', async()=>{
+  const e=editor({qwenConfig:{has_api_key:true,key_source:'environment',can_edit:false}}), s=e.state;
+  await s.openVlmModal('item');
+  assert.equal(s.qwenHasKey.value,true);
+  assert.equal(s.qwenKeySource.value,'environment');
+  assert.equal(s.qwenKeyEditable.value,false);
+  s.qwenKeyValue.value='should-not-be-saved';
+  await s.saveQwenKey();
+  assert.equal(e.requests.some(request=>request.url==='/api/qwen-config' && request.method==='PUT'),false);
+});
 
 test('combined editor focuses the issue field and protects an unsaved draft', async()=>{
   const e=editor(), s=e.state;

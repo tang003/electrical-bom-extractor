@@ -1825,7 +1825,8 @@ def get_qwen_config() -> Dict[str, Any]:
     env_key = bool(os.environ.get('DASHSCOPE_API_KEY'))
     saved_key = bool(read_qwen_api_key())
     return {'model':QWEN_MODEL,'has_api_key':env_key or saved_key,
-            'key_source':'environment' if env_key else 'saved' if saved_key else 'none'}
+            'key_source':'environment' if env_key else 'saved' if saved_key else 'none',
+            'can_edit':os.environ.get('ELECTRICAL_BOM_SERVER_MODE') != '1'}
 
 
 @app.put('/api/qwen-config')
