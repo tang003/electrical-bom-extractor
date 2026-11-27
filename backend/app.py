@@ -12,10 +12,11 @@ import shutil
 import time
 import threading
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Literal, Annotated
+from typing import Dict, Any, Optional, List, Literal, Annotated, Callable
 
 import cv2
 import numpy as np
@@ -61,7 +62,7 @@ from bom_extractor.field_classifier import (QWEN_MODEL, VERSION as FIELD_CLASSIF
 from bom_extractor.independent import analysis_source, independent_policy, legacy_table_project, schematic_pages
 from bom_extractor.reconciliation import norm, reconcile, tag_key
 from bom_extractor.table_workflow import table_policy,TABLE_MODE,CHECK_MODE
-from .ai_jobs import AIJobManager
+from .ai_jobs import ACTIVE as ACTIVE_AI_STATUSES, AIJobManager
 from .pg_store import PgRepository, Conflict
 from .auth import actor, request_id, create_auth_router
 from .page_images import page_image
@@ -81,6 +82,8 @@ app = FastAPI(
     title="工业电气原理图 BOM 自动提取与图文审核系统",
     version="1.0.0",
 )
+
+IMPORT_JOB_FILE = "import_job.json"
 
 _allowed_hosts = ["127.0.0.1", "localhost", "[::1]", "testserver", "bom", "electrical-bom"]
 _allowed_hosts.extend(host.strip() for host in os.environ.get('ELECTRICAL_BOM_ALLOWED_HOSTS', '').split(',') if host.strip())
@@ -124,7 +127,7 @@ async def add_no_cache_header(request: Request, call_next):
             match=re.match(r'^/api/projects/([^/]+)',request.url.path)
             if match and match.group(1) in store.data_versions:
                 response.headers['X-BOM-Version']=str(store.data_versions[match.group(1)])
-        if request.url.path.startswith("/assets/") or request.url.path == "/":
+        if request.url.path.startswith("/assets/") or request.url.path in ("/", "/projects", "/workbench", "/api/drawings"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
@@ -177,6 +180,8 @@ class ProjectStore:
             snapshots = [state_path] if state_path.exists() else sorted(proj_dir.glob("*_提取结果.json"))
             pdfs = sorted(p for p in proj_dir.glob("*.pdf") if p.name!='schematic_only.pdf')
             pdfs.sort(key=lambda p:p.name!='source.pdf')
+            if (proj_dir / IMPORT_JOB_FILE).exists() and not state_path.exists():
+                continue
             try:
                 if not state_path.exists() and (proj_dir / "import_failure.json").exists():
                     failure = json.loads((proj_dir / "import_failure.json").read_text(encoding="utf-8"))
@@ -367,6 +372,21 @@ def on_startup() -> None:
         raise RuntimeError('请设置 BOM_DATABASE_URL；生产工作台必须使用 PostgreSQL 与账号验证')
     VisionRecognizer.load_saved_config()  # migrate any legacy credential before serving requests
     store.initialize_defaults()
+    app.state.drawing_imports = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drawing-import")
+    for path, job in sorted(_drawing_import_jobs(), key=lambda entry: entry[1]["created_at"]):
+        if job["status"] not in ("queued", "running"):
+            continue
+        if job["project_id"] in store.results:
+            _set_import_status(path, job, "completed", "已保存提取结果")
+        elif job["status"] == "running":
+            _set_import_status(path, job, "interrupted", "服务器重启时解析中断，请重新上传图纸")
+        else:
+            app.state.drawing_imports.submit(_run_drawing_import, path, job)
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    app.state.drawing_imports.shutdown(wait=True, cancel_futures=True)
 
 
 @serialized_mutation
@@ -389,8 +409,7 @@ def _serialize_project_response(proj_id: str) -> Dict[str, Any]:
     return data
 
 
-@app.get("/", response_class=HTMLResponse)
-def index_page(request: Request) -> HTMLResponse:
+def _page_login_redirect(request: Request):
     if repository:
         try:
             user=auth_service.current(request)
@@ -398,6 +417,15 @@ def index_page(request: Request) -> HTMLResponse:
             return RedirectResponse('/login',status_code=303)
         if user['must_change_password']:
             return RedirectResponse('/login?change=1',status_code=303)
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/workbench", response_class=HTMLResponse)
+def index_page(request: Request) -> HTMLResponse:
+    if redirect := _page_login_redirect(request):
+        return redirect
+    if request.url.path == "/" and not request.query_params.get("project"):
+        return RedirectResponse("/projects", status_code=303)
     index_file = FRONTEND_DIR / "index.html"
     if not index_file.exists():
         return HTMLResponse("<h1>Frontend index.html not found</h1>", status_code=404)
@@ -430,13 +458,18 @@ def admin_page(request: Request):
 
 @app.get('/projects',response_class=HTMLResponse)
 def projects_page(request: Request):
-    if repository: auth_service.require(request)
+    if redirect := _page_login_redirect(request):
+        return redirect
     return HTMLResponse((FRONTEND_DIR/'projects.html').read_text(encoding='utf-8'))
 
 
 @app.get("/api/projects")
 @serialized_mutation
 def list_projects() -> List[Dict[str, Any]]:
+    return _list_projects()
+
+
+def _list_projects(*, include_processing=False) -> List[Dict[str, Any]]:
     items = []
     visible=store.repository.visible_ids(actor.get()['id']) if store.repository else set(store.results)
     for pid, res in store.results.items():
@@ -458,6 +491,9 @@ def list_projects() -> List[Dict[str, Any]]:
             "pending_review_count": sum(1 for r in res.review_items if r.status == "PENDING"),
             "evaluation_metrics": None,
         })
+        if include_processing:
+            items[-1]["ai_job_id"] = res.summary.get("ai_job_id")
+            items[-1]["ai_start_warning"] = res.summary.get("ai_start_warning")
     return items
 
 
@@ -547,7 +583,7 @@ def project_load_errors():
 @app.post("/api/projects/clear")
 @serialized_mutation
 def clear_all_projects() -> Dict[str, Any]:
-    if any(job["status"] in ("queued","running","reviewing","merging") for job in ai_jobs.jobs.values()):
+    if any(job["status"] in ACTIVE_AI_STATUSES for job in ai_jobs.jobs.values()):
         raise HTTPException(status_code=409, detail="请先取消正在运行的 AI 任务，再清空项目")
     if store.repository:
         user=actor.get()
@@ -555,6 +591,8 @@ def clear_all_projects() -> Dict[str, Any]:
         for pid in store.repository.visible_ids(user['id']):
             store.repository.move_state(pid,user['id'],'trash')
         return {'status':'trashed','projects':[]}
+    if any(job["status"] in ("queued", "running") for _, job in _drawing_import_jobs()):
+        raise HTTPException(status_code=409, detail="请等图纸导入结束后再清空项目")
     store.clear_all()
     return {"status": "cleared", "projects": []}
 
@@ -572,6 +610,8 @@ def get_page_references(project_id: str) -> Dict[str, Any]:
         source_path = store.pdf_paths.get(project_id)
         if result is None or source_path is None:
             raise HTTPException(404, detail='项目或原图不存在')
+        if table_policy(result):
+            return {'project_id': project_id, 'version': PAGE_REFERENCE_VERSION, 'links': [], 'cache_hit': False}
         pages = copy.deepcopy(result.pages)
         source = analysis_source(result, source_path, OUTPUT_DIR / project_id)
     metadata = [(page.page_num, page.sheet_no,
@@ -639,18 +679,18 @@ def supported_drawing_formats():
     return {"formats": drawing_capabilities(), "max_upload_bytes": 100 * 1024 * 1024}
 
 
-def _extract_uploaded_drawing(source, upload_dir, project_id, display_name,workflow_mode=CHECK_MODE):
+def _extract_uploaded_drawing(source, upload_dir, project_id, display_name, workflow_mode=CHECK_MODE, report=None):
     fmt = source.suffix.lower()
     pdf = prepare_cad(source, upload_dir, display_name) if fmt in {".dwg", ".dxf"} else source
+    if report:
+        report("正在读取图页并提取物料")
     with pymupdf.open(pdf) as doc:
         if not doc.is_pdf or not len(doc):
             raise ValueError("审核视图无有效页面")
     return pdf, run_extraction_pipeline(pdf, output_dir=upload_dir, project_id=project_id,workflow_mode=workflow_mode)
 
 
-@app.post("/api/projects/upload")
-async def upload_pdf(file: UploadFile = File(...),workflow_mode: Annotated[Literal['SCHEMATIC_CHECK','TABLE_EXTRACT'],Form()]=CHECK_MODE) -> Dict[str, Any]:
-    if workflow_mode not in {CHECK_MODE,TABLE_MODE}:raise HTTPException(400,'无效的处理模式')
+def _save_drawing_upload(file: UploadFile) -> tuple[str, str, Path]:
     if not file.filename or Path(file.filename).suffix.lower() not in {".pdf", ".dwg", ".dxf"}:
         raise HTTPException(status_code=400, detail="请上传 PDF、DWG 或 DXF 格式的电气图纸文件")
 
@@ -675,15 +715,32 @@ async def upload_pdf(file: UploadFile = File(...),workflow_mode: Annotated[Liter
                 f.write(chunk)
         if not size:
             raise HTTPException(status_code=400, detail="图纸文件为空")
-        saved_pdf, res = await run_in_threadpool(_extract_uploaded_drawing, saved_source, upload_dir, proj_id, display_name,workflow_mode)
+    except Exception:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise
+    return proj_id, display_name, saved_source
+
+
+def _finish_drawing_upload(
+    proj_id: str, display_name: str, source: Path, workflow_mode: str,
+    report: Callable[[str], None] | None = None,
+) -> str | None:
+    upload_dir = source.parent
+    source_format = source.suffix[1:]
+    try:
+        saved_pdf, res = _extract_uploaded_drawing(source, upload_dir, proj_id, display_name, workflow_mode, report)
     except Exception as exc:
-        message = str(exc) if isinstance(exc, CadImportError) else (str(exc.detail) if isinstance(exc, HTTPException) else "图纸解析失败，请检查文件内容；源文件和导入日志已保留。")
-        (upload_dir / "import_failure.json").write_text(json.dumps({"source_filename":display_name,"source_format":source_format,"message":message},ensure_ascii=False),encoding="utf-8")
-        if isinstance(exc, HTTPException):raise
+        message = str(exc) if isinstance(exc, CadImportError) else "图纸解析失败，请检查文件内容。源文件和导入日志已保留。"
+        save_json(upload_dir / "import_failure.json", {
+            "source_filename": display_name, "source_format": source_format, "message": message,
+        })
+        logging.getLogger(__name__).exception("图纸解析失败 %s", proj_id)
         raise HTTPException(status_code=exc.status_code if isinstance(exc, CadImportError) else 400, detail=message) from exc
     res.pdf_filename = display_name
     res.source_filename = display_name
     res.source_format = source_format
+    if report:
+        report("正在保存图纸和 BOM")
     with store.lock:
         store.pdf_paths[proj_id] = saved_pdf
         store.results[proj_id] = res
@@ -692,10 +749,105 @@ async def upload_pdf(file: UploadFile = File(...),workflow_mode: Annotated[Liter
         except Exception:
             store.pdf_paths.pop(proj_id, None)
             store.results.pop(proj_id, None)
-            shutil.rmtree(upload_dir, ignore_errors=True)
             raise
-    _auto_start_ai(proj_id)
+        _auto_start_ai(proj_id)
+        return res.summary.get("ai_job_id")
+
+
+@app.post("/api/projects/upload")
+async def upload_pdf(file: UploadFile = File(...),workflow_mode: Annotated[Literal['SCHEMATIC_CHECK','TABLE_EXTRACT'],Form()]=CHECK_MODE) -> Dict[str, Any]:
+    if workflow_mode not in {CHECK_MODE,TABLE_MODE}:raise HTTPException(400,'无效的处理模式')
+    proj_id, display_name, source = await run_in_threadpool(_save_drawing_upload, file)
+    await run_in_threadpool(_finish_drawing_upload, proj_id, display_name, source, workflow_mode)
     return _serialize_project_response(proj_id)
+
+
+def _drawing_import_jobs():
+    for path in OUTPUT_DIR.glob(f"proj_*/{IMPORT_JOB_FILE}"):
+        try:
+            yield path, json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logging.getLogger(__name__).warning("无法读取图纸导入任务 %s", path, exc_info=True)
+
+
+def _set_import_status(path: Path, job: dict, status: str, message: str) -> None:
+    job.update(status=status, message=message)
+    save_json(path, job)
+
+
+def _run_drawing_import(path: Path, job: dict) -> None:
+    token = actor.set({"id": job["owner_id"]} if job["owner_id"] else None)
+    audit_token = request_id.set(job["request_id"])
+
+    def report(message: str) -> None:
+        _set_import_status(path, job, "running", message)
+
+    try:
+        report("正在读取图纸" if job["source_format"] == "pdf" else "正在转换 CAD 并生成分页视图")
+        source = path.parent / f"source.{job['source_format']}"
+        job["initial_ai_job_id"] = _finish_drawing_upload(job["project_id"], job["filename"], source, job["workflow_mode"], report)
+        _set_import_status(path, job, "completed", "已保存提取结果")
+    except HTTPException as exc:
+        _set_import_status(path, job, "failed", str(exc.detail))
+    except Exception:
+        logging.getLogger(__name__).exception("图纸导入任务失败 %s", job["project_id"])
+        _set_import_status(path, job, "failed", "图纸处理未完成，请重新上传或联系管理员。")
+    finally:
+        request_id.reset(audit_token)
+        actor.reset(token)
+
+
+@app.post("/api/drawing-imports", status_code=202)
+async def queue_drawing_upload(
+    file: UploadFile = File(...),
+    workflow_mode: Annotated[Literal["SCHEMATIC_CHECK", "TABLE_EXTRACT"], Form()] = CHECK_MODE,
+):
+    proj_id, display_name, source = await run_in_threadpool(_save_drawing_upload, file)
+    user = actor.get()
+    job = {
+        "project_id": proj_id, "filename": display_name, "source_format": source.suffix[1:],
+        "workflow_mode": workflow_mode, "owner_id": str(user["id"]) if user else None,
+        "request_id": request_id.get(), "created_at": time.time(),
+    }
+    path = source.parent / IMPORT_JOB_FILE
+    _set_import_status(path, job, "queued", "等待服务器解析")
+    app.state.drawing_imports.submit(_run_drawing_import, path, job.copy())
+    return {"project_id": proj_id, "status": job["status"]}
+
+
+@app.get("/api/drawings")
+def list_drawings():
+    with store.lock:
+        projects = _list_projects(include_processing=True)
+    for project in projects:
+        if job_id := project.pop("ai_job_id"):
+            try:
+                job = ai_jobs.get(project["project_id"], job_id)
+            except KeyError:
+                project["ai_start_warning"] = "AI 任务状态不可用，已保存初步提取结果。"
+            else:
+                project["ai_job"] = {
+                    key: job.get(key) for key in ("id", "status", "message", "completed_pages", "total_pages")
+                }
+    visible = {project["project_id"]: project for project in projects}
+    user = actor.get()
+    imports = []
+    for _, job in _drawing_import_jobs():
+        if project := visible.get(job["project_id"]):
+            if (ai_job := project.get("ai_job")) and ai_job["status"] in ACTIVE_AI_STATUSES:
+                project["initial_ai_pending"] = (
+                    job["status"] == "running" or ai_job["id"] == job.get("initial_ai_job_id")
+                )
+            continue
+        if job["status"] == "completed":
+            continue
+        if user and user["role"] != "admin" and job["owner_id"] != str(user["id"]):
+            continue
+        imports.append({
+            key: job[key] for key in ("project_id", "filename", "workflow_mode", "created_at", "status", "message")
+        })
+    imports.sort(key=lambda job: job["created_at"], reverse=True)
+    return {"projects": projects, "imports": imports}
 
 
 @app.get("/api/projects/{project_id}/source")

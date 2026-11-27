@@ -35,12 +35,12 @@ class AIJobManager:
     def path(self, project, job):
         return Path(self.get_output()) / project / "ai_jobs" / job / "job.json"
 
-    def save(self, job):
+    def save(self, job, *, actor_id=None):
         with self.guard:
             job["updated_at"] = time.time()
             repo=self.get_store().repository
             if repo:
-                with repo.connection(job.get('requested_by')) as conn:
+                with repo.connection(actor_id or job.get('requested_by')) as conn:
                     conn.execute("INSERT INTO ai_jobs(id,project_id,input_data_version,drawing_version,requested_by,status,progress,cancel_requested,heartbeat_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,now()) ON CONFLICT(id) DO UPDATE SET status=excluded.status,progress=excluded.progress,cancel_requested=excluded.cancel_requested,heartbeat_at=now(),updated_at=now(),input_data_version=excluded.input_data_version",(job['id'],job['project_id'],job.get('input_data_version',0),job.get('drawing_version',1),job.get('requested_by'),job['status'],json.dumps(job,ensure_ascii=False),job.get('cancel_requested',False)))
             else:
                 save_json(self.path(job["project_id"],job["id"]), job)
@@ -50,8 +50,9 @@ class AIJobManager:
             job = self.jobs.get((project,job_id))
             if job is None:
                 repo=self.get_store().repository
+                current_actor = actor.get()
                 if repo:
-                    with repo.connection(actor.get()['id'] if actor.get() else None) as conn:
+                    with repo.connection(current_actor['id'] if current_actor else None) as conn:
                         row=conn.execute('SELECT progress FROM ai_jobs WHERE project_id=%s AND id=%s',(project,job_id)).fetchone()
                     if not row: raise KeyError(job_id)
                     job=row['progress']
@@ -62,7 +63,7 @@ class AIJobManager:
                 if job["status"] in ACTIVE:
                     job["status"] = "interrupted"
                     job["message"] = "服务重启中断了任务；可重新运行，已完成页面会使用缓存。"
-                    self.save(job)
+                    self.save(job, actor_id=current_actor['id'] if current_actor else None)
                 self.jobs[(project,job_id)] = job
             return copy.deepcopy(job)
 

@@ -1,11 +1,117 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>项目管理 · 电气 BOM 工作台</title><style>
-body{font:15px system-ui,-apple-system,sans-serif;background:#f4f7fb;color:#172338;margin:0}main{max-width:1000px;margin:40px auto;padding:0 24px}a{color:#2563eb}section{background:white;border:1px solid #dce4ee;border-radius:12px;padding:24px;margin:20px 0}table{width:100%;border-collapse:collapse}td,th{padding:12px;border-bottom:1px solid #e5ebf2;text-align:left}button,select{padding:8px 12px;border:1px solid #b9c6d5;border-radius:6px;background:white;font:inherit;cursor:pointer}button.danger{color:#b91c1c}#message{color:#b91c1c;min-height:24px}.history{padding:14px;background:#f8fafc;margin:8px 0;border-radius:8px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-</style></head><body><main><a href="/">← 返回工作台</a><h1>项目管理</h1><p>项目移入回收站后可恢复。恢复历史版本会生成新的版本记录。</p><section><h2>当前项目</h2><table><thead><tr><th>项目</th><th>所有者</th><th>操作</th></tr></thead><tbody id="projects"></tbody></table></section><section><h2>回收站</h2><table><thead><tr><th>项目</th><th>操作</th></tr></thead><tbody id="trash"></tbody></table></section><section id="history-section" hidden><h2 id="history-title">历史版本</h2><div id="history"></div></section><p id="message" role="alert"></p></main><script src="/assets/auth.js"></script><script>
-const msg=document.querySelector('#message');let users=[],ownership=[];
-async function api(url,opts){let r=await fetch(url,opts);let x=await r.json();if(!r.ok)throw Error(x.detail||'操作失败');return x}
-async function post(url,payload){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:payload?JSON.stringify(payload):undefined})}
-function cell(text){let td=document.createElement('td');td.textContent=text;return td}
-async function refresh(){try{let me=await api('/api/auth/me');let projects=await api('/api/projects'),trash=await api('/api/projects/trash');if(me.role==='admin'){users=await api('/api/auth/users');ownership=await api('/api/projects/ownership')}document.querySelector('#projects').replaceChildren(...projects.map(p=>{let tr=document.createElement('tr'),actions=cell('');actions.className='actions';let link=document.createElement('a');link.href='/?project='+encodeURIComponent(p.project_id);link.textContent='打开';let history=document.createElement('button');history.textContent='历史';history.onclick=()=>showHistory(p);let remove=document.createElement('button');remove.textContent='移入回收站';remove.className='danger';remove.onclick=async()=>{if(!confirm('将该项目移入回收站？'))return;try{await post(`/api/projects/${encodeURIComponent(p.project_id)}/trash`);refresh()}catch(e){msg.textContent=e.message}};actions.append(link,history,remove);if(me.role==='admin'){let select=document.createElement('select');for(let u of users.filter(u=>u.active)){let option=document.createElement('option');option.value=u.id;option.textContent=u.username;select.append(option)}select.value=ownership.find(o=>o.id===p.project_id)?.owner_id||'';let transfer=document.createElement('button');transfer.textContent='转交';transfer.onclick=async()=>{try{await post(`/api/projects/${encodeURIComponent(p.project_id)}/transfer`,{owner_id:select.value});refresh()}catch(e){msg.textContent=e.message}};actions.append(select,transfer)}tr.append(cell(p.project_name||p.pdf_filename),cell(ownership.find(o=>o.id===p.project_id)?.username||'本人'),actions);return tr}));document.querySelector('#trash').replaceChildren(...trash.map(p=>{let tr=document.createElement('tr'),actions=cell('');let button=document.createElement('button');button.textContent='恢复';button.onclick=async()=>{try{await post(`/api/projects/${encodeURIComponent(p.id)}/restore`);refresh()}catch(e){msg.textContent=e.message}};actions.append(button);tr.append(cell(p.name),actions);return tr}));}catch(e){msg.textContent=e.message}}
-async function showHistory(p){try{let rows=await api(`/api/projects/${encodeURIComponent(p.project_id)}/revisions`);document.querySelector('#history-title').textContent='历史版本 · '+(p.project_name||p.pdf_filename);let section=document.querySelector('#history-section');section.hidden=false;document.querySelector('#history').replaceChildren(...rows.map(r=>{let box=document.createElement('div');box.className='history';let label=document.createElement('span');label.textContent=`版本 ${r.version} · ${r.summary} · ${new Date(r.created_at).toLocaleString()}`;let button=document.createElement('button');button.textContent='恢复此版本';button.style.marginLeft='12px';button.onclick=async()=>{if(!confirm('恢复此版本并生成新版本？'))return;try{let current=await api(`/api/projects/${encodeURIComponent(p.project_id)}`);await post(`/api/projects/${encodeURIComponent(p.project_id)}/revisions/${r.version}/restore`,{expected_version:current.data_version});msg.textContent='已恢复';refresh()}catch(e){msg.textContent=e.message}};box.append(label,button);return box}));section.scrollIntoView({behavior:'smooth'})}catch(e){msg.textContent=e.message}}
-refresh();
-</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图纸列表 · 电气 BOM 工作台</title>
+  <style>
+    body { margin: 0; background: #f4f7fb; color: #172338; font: 15px system-ui, sans-serif; }
+    main { max-width: 1120px; margin: 36px auto; padding: 0 24px; }
+    h1 { margin: 8px 0 0; font-size: 30px; }
+    h2 { margin-top: 0; font-size: 19px; }
+    a { color: #1d4ed8; text-underline-offset: 3px; }
+    header, nav, .actions, .dialog-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+    header { justify-content: space-between; gap: 18px; margin-bottom: 20px; }
+    nav { font-size: 14px; }
+    section { margin: 16px 0; padding: 22px; border: 1px solid #dce4ee; border-radius: 12px; background: white; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    .drawings { table-layout: fixed; }
+    .drawings col { width: 29%; }
+    .drawings col.owner { width: 13%; }
+    td, th { padding: 13px 10px; border-bottom: 1px solid #e5ebf2; text-align: left; vertical-align: top; }
+    th, .detail, .brand { color: #475569; font-size: 13px; }
+    .drawing-name { overflow-wrap: anywhere; }
+    .detail { display: block; margin-top: 4px; }
+    .status strong { display: block; font-size: 14px; }
+    .status[data-tone="ready"] strong { color: #176247; }
+    .status[data-tone="active"] strong { color: #1d4ed8; }
+    .status[data-tone="alert"] strong, .danger, #upload-error { color: #a52424; }
+    button, select { padding: 7px 10px; border: 1px solid #becbda; border-radius: 6px; background: white; color: inherit; font: inherit; }
+    button, summary { cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .65; }
+    .actions select { min-width: 0; max-width: 100%; }
+    button.primary { padding: 9px 15px; border-color: #1d4ed8; background: #1d4ed8; color: white; }
+    #message:empty, #upload-error:empty { display: none; }
+    #message { margin: 10px 0; }
+    .history { margin: 8px 0; padding: 12px; background: #f4f7fb; border-radius: 6px; }
+    .history button { margin-left: 10px; }
+    dialog { box-sizing: border-box; width: min(490px, calc(100% - 32px)); padding: 24px; border: 1px solid #becbda; border-radius: 12px; color: inherit; }
+    dialog::backdrop { background: #17233880; }
+    fieldset { margin: 18px 0; padding: 12px; border: 1px solid #dce4ee; border-radius: 6px; }
+    fieldset label { display: block; padding: 5px 0; }
+    .file-label { display: block; margin-bottom: 8px; }
+    .dialog-actions { justify-content: flex-end; }
+    [hidden] { display: none !important; }
+    @media (max-width: 540px) {
+      main { margin: 22px auto; padding: 0 14px; }
+      section { padding: 12px; }
+      .drawings th, .drawings td { padding: 9px 5px; overflow-wrap: anywhere; }
+      .actions { gap: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="brand">电气 BOM 工作台</div>
+        <h1>图纸列表</h1>
+      </div>
+      <nav aria-label="工作台导航">
+        <a href="/workbench">工作台工具</a>
+        <a id="admin-link" href="/admin" hidden>账号管理</a>
+        <button type="button" id="logout" hidden>退出登录</button>
+        <button type="button" class="primary" id="show-upload">上传图纸</button>
+      </nav>
+    </header>
+
+    <p id="message" role="status"></p>
+    <section aria-label="当前图纸">
+      <div class="table-scroll">
+        <table class="drawings">
+          <colgroup><col><col><col class="owner"><col></colgroup>
+          <thead><tr><th scope="col">图纸</th><th scope="col">处理状态</th><th scope="col">所有者</th><th scope="col">操作</th></tr></thead>
+          <tbody id="imports"></tbody>
+          <tbody id="projects"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="detail">正在加载图纸…</p>
+    </section>
+    <section>
+      <details>
+        <summary>回收站</summary>
+        <table aria-label="回收站图纸">
+          <thead><tr><th scope="col">项目</th><th scope="col">操作</th></tr></thead>
+          <tbody id="trash"></tbody>
+        </table>
+        <p id="trash-empty" class="detail">回收站为空。</p>
+      </details>
+    </section>
+    <section id="history-section" hidden>
+      <h2 id="history-title">历史版本</h2>
+      <div id="history"></div>
+    </section>
+
+    <dialog id="upload-dialog" aria-labelledby="upload-title">
+      <form id="upload-form">
+        <h2 id="upload-title">上传图纸</h2>
+        <label class="file-label" for="drawing-file">选择 PDF、DWG 或 DXF 文件（最多 100 MB）</label>
+        <input type="file" id="drawing-file" name="file" accept=".pdf,.dwg,.dxf" required>
+        <fieldset>
+          <legend>处理方式</legend>
+          <label><input type="radio" name="workflow_mode" value="SCHEMATIC_CHECK" checked> 原理图识别并核对</label>
+          <label><input type="radio" name="workflow_mode" value="TABLE_EXTRACT"> 仅提取部件表</label>
+        </fieldset>
+        <p id="upload-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" id="cancel-upload">取消</button>
+          <button type="submit" class="primary" id="submit-upload">上传并排队</button>
+        </div>
+      </form>
+    </dialog>
+  </main>
+  <script src="/assets/auth.js"></script>
+  <script src="/assets/projects.js"></script>
+</body>
+</html>

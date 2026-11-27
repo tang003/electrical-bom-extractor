@@ -417,22 +417,22 @@ createApp({
         const errors = await recovery.json();
         if (Object.keys(errors).length) showToast(`部分项目无法恢复，原文件已保留：${Object.keys(errors).join("、")}`);
       }
-      if (projects.value.length > 0 && !currentProjectId.value) {
-        const remembered = readWorkspacePreferences().projectId;
+      if (!currentProjectId.value) {
         const params = new URLSearchParams(window.location?.search || '');
         const requested = params.get('project');
-        const chosen = projects.value.find(p => p.project_id === requested)?.project_id ||
-          projects.value.find(p => p.project_id === remembered)?.project_id || projects.value[0].project_id;
-        await loadProject(chosen);
-        if (requested === chosen) {
-          const page = Number(params.get('page'));
-          if (Number.isInteger(page) && page >= 1 && page <= (projectData.value?.page_count || 0)) {
-            currentPage.value = page;
-            if (showSomLayer.value) await loadPageTopology();
-          }
-          if (params.get('tag')) searchQuery.value = params.get('tag');
+        if (!requested) return;
+        if (!projects.value.some(p => p.project_id === requested)) {
+          showToast('该图纸不可用，请返回图纸列表。');
+          return;
         }
-      } else if (projects.value.length === 0) {
+        await loadProject(requested);
+        const page = Number(params.get('page'));
+        if (Number.isInteger(page) && page >= 1 && page <= (projectData.value?.page_count || 0)) {
+          currentPage.value = page;
+          if (showSomLayer.value) await loadPageTopology();
+        }
+        if (params.get('tag')) searchQuery.value = params.get('tag');
+      } else if (!projects.value.length) {
         currentProjectId.value = "";
         projectData.value = null;
       }
@@ -491,7 +491,6 @@ createApp({
         deviceInventory.value = null;
         inventoryFamily.value = 'ALL';
         showAddModal.value = false;
-        saveWorkspacePreferences({projectId:projId});
         currentPage.value = 1;
         showAnalysisView.value = false;
         reconciliationFilter.value = 'PENDING';
@@ -1547,6 +1546,42 @@ createApp({
       const id = editingId.value || detailItemId.value;
       return [...(projectData.value?.itemized_bom || []), ...(projectData.value?.aggregated_bom || []), ...(projectData.value?.filtered_items || [])].find(item => item.id === id) || null;
     });
+    const evidencePreviewIndex = ref(null);
+    const evidencePreviewError = ref(false);
+    watch(drawerItem, () => { evidencePreviewIndex.value = null; });
+    function toggleEvidencePreview(index) {
+      evidencePreviewError.value = false;
+      evidencePreviewIndex.value = evidencePreviewIndex.value === index ? null : index;
+      if (evidencePreviewIndex.value === index) {
+        nextTick(() => document.getElementById('evidence-preview-' + index)?.scrollIntoView?.({block: 'nearest'}));
+      }
+    }
+    const evidencePreview = computed(() => {
+      const evidence = drawerItem.value?.evidences?.[evidencePreviewIndex.value];
+      if (!evidence) return null;
+      const page = projectData.value?.pages?.find(info => info.page_num === evidence.page);
+      if (!page) return {evidence};
+
+      const url = `/api/projects/${encodeURIComponent(currentProjectId.value)}/pages/${page.page_num}/image?dpi=150`;
+      const box = evidence.norm_bbox;
+      if (!hasDrawingBox(box) || !(page.width > 0 && page.height > 0)) return {evidence, url};
+
+      const [x0, y0, x1, y1] = box;
+      const [left, top, right, bottom] = centeredDrawingBox(
+        box, Math.min(1, Math.max(.16, (x1 - x0) * 1.6)), Math.min(1, Math.max(.09, (y1 - y0) * 2)),
+      );
+      const width = right - left, height = bottom - top;
+      const ratio = page.width * width / (page.height * height);
+      return {
+        evidence, url,
+        frameStyle: {aspectRatio: ratio, maxWidth: `${250 * ratio}px`},
+        imageStyle: {left: `${-100 * left / width}%`, top: `${-100 * top / height}%`, width: `${100 / width}%`, height: `${100 / height}%`},
+        markerStyle: {
+          left: `${100 * (x0 - left) / width}%`, top: `${100 * (y0 - top) / height}%`,
+          width: `${100 * (x1 - x0) / width}%`, height: `${100 * (y1 - y0) / height}%`,
+        },
+      };
+    });
     const fieldClassification = ref(null);
     const fieldClassificationBusy = ref(false);
     const fieldClassificationError = ref('');
@@ -1705,11 +1740,11 @@ createApp({
       if (workspaceMode.value === 'bom') { setWorkspaceMode('compare'); await nextTick(); }
       await zoomToBomRow(item);
     }
-    async function locateItemEvidence(item, evidence) {
-      const tag = item.tag;
+    async function locateItemEvidence(item, evidence, fromPreview = false) {
       if (!closeItemPanel()) return;
+      if (fromPreview) showAnalysisView.value = false;
       if (workspaceMode.value === 'bom') { setWorkspaceMode('compare'); await nextTick(); }
-      jumpToBomEvidence(item, evidence, tag);
+      await jumpToBomEvidence(item, evidence, fromPreview ? evidence.raw_text || item.tag : item.tag);
     }
     async function deletePanelItem(item) {
       if (editDirty.value || savingEdit.value) return;
@@ -2228,30 +2263,25 @@ createApp({
       const file=pendingUpload.value;
       if (!file || loading.value) return;
       loading.value = true;
-      showUploadDialog.value=false;
-      const isCad = /\.(dwg|dxf)$/i.test(file.name);
-      loadingMessage.value = isCad ? '正在读取 CAD、按图框分页并生成审核视图，请稍候…' : '正在读取 PDF 并提取物料…';
+      loadingMessage.value = '正在上传图纸…';
       try {
         const formData = new FormData();
         formData.append("file", file);
         formData.append('workflow_mode',uploadWorkflow.value);
-        const res = await fetch("/api/projects/upload", {
+        const res = await fetch("/api/drawing-imports", {
           method: "POST",
           body: formData,
         });
         if (!res.ok) {
           const err = await res.json();
-          showToast(err.detail || "上传解析失败");showUploadDialog.value=true;
+          showToast(err.detail || "上传失败");
           return;
         }
-        const data = await res.json();
-        await fetchProjects();
-        await loadProject(data.project_id);
         pendingUpload.value=null;
-        setWorkspaceMode('compare');
-        showToast(data.summary?.cad_import ? `已导入 ${data.page_count} 张 CAD 图纸，请先查看导入提醒并核对有效图框。` : data.summary?.extraction_quality?.status === "LOW_COVERAGE" ? "提取覆盖不足，请先查看质量提示并核实原图。" : `已完成 [${file.name}] 初步提取，请核对型号和采购范围。`);
+        showUploadDialog.value=false;
+        window.location.href = '/projects';
       } catch {
-        showToast('图纸导入连接失败，请检查服务和文件，已有项目仍可查看。');
+        showToast('上传连接失败，请检查图纸列表中的提交状态。');
       } finally {
         loading.value = false;
       }
@@ -2431,6 +2461,7 @@ createApp({
       qwenKeyValue, qwenHasKey, qwenKeySource, qwenKeySaving, qwenTestBusy, qwenTestResult,
       openQwenKeyEditor, saveQwenKey, testQwenConnection,
       openItemDetails, openItemIssue, tableCountLabel, closeItemPanel, locateItem, locateItemEvidence, deletePanelItem, closeToolsMenu,
+      evidencePreviewIndex, evidencePreview, evidencePreviewError, toggleEvidencePreview,
       isResizingSplit,
       pdfViewportRef,
       pdfStageRef,

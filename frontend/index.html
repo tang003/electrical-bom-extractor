@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>工业电气原理图 BOM 智能提取与图文核对工作台</title>
   <link rel="stylesheet" href="/assets/styles.css?v=6" />
-  <link rel="stylesheet" href="/assets/workbench.css?v=20261126-terminal-page-quantity" />
+  <link rel="stylesheet" href="/assets/workbench.css?v=20261126-evidence-preview" />
 </head>
 <body>
   <div id="app" class="bom-app" v-cloak>
@@ -17,6 +17,7 @@
       <div class="project-picker" v-if="projects.length">
         <label for="project-picker">当前项目</label>
         <select id="project-picker" class="project-select" v-model="currentProjectId" @change="loadProject(currentProjectId)">
+          <option value="" disabled>选择图纸</option>
           <option v-for="p in projects" :key="p.project_id" :value="p.project_id">{{ p.pdf_filename }} · {{ p.page_count }} 页{{ p.workflow_mode === 'TABLE_EXTRACT' ? ' · 仅提部件表' : p.extraction_mode_label?.includes('独立识别') ? ' · 独立分析' : p.extraction_mode === 'PART_LIST_MODE' ? ' · 历史清单' : '' }}</option>
         </select>
       </div>
@@ -658,7 +659,34 @@
           <section class="detail-section" v-if="drawerItem.readiness?.issues?.length || drawerItem.review_note"><h3>待办与识别说明</h3><div class="issue-chips"><span v-for="issue in drawerItem.readiness?.issues || []" :key="issue" class="status-chip chip-amber">{{ issue }}</span></div><p class="detail-prose" v-if="drawerItem.review_note">{{ drawerItem.review_note }}</p></section>
           <section class="detail-section" v-if="drawerItem.selection_suggestions?.some(s => s.status === 'PENDING')"><h3>选型建议</h3><div v-for="s in drawerItem.selection_suggestions.filter(s => s.status === 'PENDING')" :key="s.model" class="selection-proposal"><strong>{{ s.model }}</strong><p>{{ s.reason }}</p><button type="button" class="btn btn-light btn-sm" :disabled="editDirty || savingEdit" @click="applySelection(drawerItem,s,'ACCEPT')">人工采纳</button><button type="button" class="text-button" :disabled="editDirty || savingEdit" @click="applySelection(drawerItem,s,'IGNORE')">忽略</button></div></section>
           <section class="detail-section" v-if="drawerItem.remark"><h3>采购备注</h3><p class="detail-prose">{{ drawerItem.remark }}</p></section>
-          <section class="detail-section"><h3>原图证据 <span>{{ (drawerItem.evidences || []).length }} 处</span></h3><div class="evidence-list"><button type="button" v-for="(ev,index) in drawerItem.evidences || []" :key="index" @click="locateItemEvidence(drawerItem,ev)"><span>P{{ ev.page }}</span><span>{{ ev.raw_text || '图纸位置' }}</span><span aria-hidden="true">↗</span></button><p v-if="!drawerItem.evidences?.length" class="detail-prose">当前没有附加证据框，可通过图纸补录。</p></div></section>
+          <section class="detail-section">
+            <h3>原图证据 <span>{{ (drawerItem.evidences || []).length }} 处</span></h3>
+            <p v-if="drawerItem.evidences?.length" class="detail-prose evidence-hint">点击一条证据，在侧栏核对位号、型号或参数在原图上的位置。</p>
+            <div class="evidence-list">
+              <div v-for="(ev, index) in drawerItem.evidences || []" :key="index">
+                <button type="button" class="evidence-toggle" :aria-expanded="evidencePreviewIndex === index"
+                  :aria-controls="'evidence-preview-' + index" @click="toggleEvidencePreview(index)">
+                  <span>P{{ ev.page }}</span><span>{{ ev.raw_text || '图纸位置' }}</span>
+                  <span aria-hidden="true">{{ evidencePreviewIndex === index ? '▴' : '▾' }}</span>
+                </button>
+                <div :id="'evidence-preview-' + index" v-show="evidencePreviewIndex === index" class="evidence-preview">
+                  <template v-if="evidencePreviewIndex === index && evidencePreview">
+                    <div v-if="evidencePreview.url && !evidencePreviewError" class="evidence-preview-frame"
+                      :class="{ 'is-cropped': evidencePreview.markerStyle }" :style="evidencePreview.frameStyle">
+                      <img :src="evidencePreview.url" :style="evidencePreview.imageStyle" @error="evidencePreviewError = true"
+                        :alt="'第 ' + ev.page + ' 页原图证据' + (ev.raw_text ? '：' + ev.raw_text : '')">
+                      <span v-if="evidencePreview.markerStyle" class="evidence-preview-marker" :style="evidencePreview.markerStyle" aria-hidden="true"></span>
+                    </div>
+                    <p v-if="!evidencePreview.url || evidencePreviewError" class="detail-prose" role="status">暂时无法显示原图预览。</p>
+                    <p v-else-if="!evidencePreview.markerStyle" class="detail-prose">已显示证据所在的整页原图。</p>
+                    <button v-if="evidencePreview.url" type="button" class="text-button" :disabled="savingEdit"
+                      @click="locateItemEvidence(drawerItem, ev, true)">关闭侧栏并定位到图纸</button>
+                  </template>
+                </div>
+              </div>
+              <p v-if="!drawerItem.evidences?.length" class="detail-prose">当前没有附加证据框，可通过图纸补录。</p>
+            </div>
+          </section>
         </div><footer class="item-panel-footer"><button type="button" class="text-button danger-text" v-if="activeTab !== 'filtered'" @click="deletePanelItem(drawerItem)" :disabled="savingEdit || editDirty">删除</button><span>{{ savingEdit ? '正在保存…' : editDirty ? '有未保存的修改' : '暂无修改' }}</span><button type="button" class="btn btn-light" @click="closeItemPanel" :disabled="savingEdit">关闭</button><button v-if="editingId" type="submit" class="btn btn-primary" :disabled="savingEdit || editTargetChanged || !editDirty">{{ savingEdit ? '正在保存…' : '保存修改' }}</button></footer>
         </form>
       </aside>
@@ -926,8 +954,8 @@
 
   <script src="/assets/vue.global.prod.js"></script>
   <script src="/assets/auth.js"></script>
-  <script src="/assets/app.js?v=20261126-terminal-page-quantity"></script>
-  <nav style="position:fixed;right:12px;bottom:12px;z-index:100;background:white;border:1px solid #dce4ee;border-radius:8px;padding:8px 12px;font:13px system-ui"><a href="/projects">项目管理</a><span id="bom-admin-link"> · <a href="/admin">账号管理</a></span> · <a href="#" id="bom-logout">退出登录</a></nav>
+  <script src="/assets/app.js?v=20261126-evidence-preview"></script>
+  <nav style="position:fixed;right:12px;bottom:12px;z-index:55;background:white;border:1px solid #dce4ee;border-radius:8px;padding:8px 12px;font:13px system-ui"><a href="/projects">图纸列表</a><span id="bom-admin-link"> · <a href="/admin">账号管理</a></span> · <a href="#" id="bom-logout">退出登录</a></nav>
   <script>fetch('/api/auth/me').then(r=>r.json()).then(u=>{if(u.role!=='admin')document.querySelector('#bom-admin-link').hidden=true});document.querySelector('#bom-logout').onclick=async e=>{e.preventDefault();await fetch('/api/auth/logout',{method:'POST'});location.href='/login'};</script>
 </body>
 </html>

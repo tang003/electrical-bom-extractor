@@ -89,3 +89,28 @@ test('model ownership and component issues are distinct from missing selection',
   assert.equal(s.matchesIssue(e.item,'COMPONENTS'),true);
   assert.ok(s.itemIssues(e.item).includes('本体/附件待核'));
 });
+
+test('evidence previews keep the editor and its unsaved fields open', async () => {
+  const e = editor(), s = e.state;
+  s.projectData.value.pages = [{page_num: 2, width: 842, height: 595}];
+  e.item.evidences = [
+    {page: 2, raw_text: 'XML-230-18', norm_bbox: [.84, .45, .98, .48]},
+    {page: 2, raw_text: '230 V'},
+  ];
+  s.openItemDetails(e.item);
+  s.editForm.value.name = 'X轴伺服驱动器';
+  s.toggleEvidencePreview(0);
+  await e.context.Vue.nextTick();
+  assert.equal(s.evidencePreview.value.url, '/api/projects/project/pages/2/image?dpi=150');
+  assert.ok(s.evidencePreview.value.markerStyle);
+  assert.equal(s.editingId.value, e.item.id);
+  assert.equal(s.editDirty.value, true);
+  assert.equal(s.currentPage.value, 8);
+
+  s.toggleEvidencePreview(1);
+  assert.equal(s.evidencePreview.value.evidence.raw_text, '230 V');
+  assert.equal(s.evidencePreview.value.markerStyle, undefined);
+  s.toggleEvidencePreview(1);
+  assert.equal(s.evidencePreview.value, null);
+  assert.equal(s.editForm.value.name, 'X轴伺服驱动器');
+});
